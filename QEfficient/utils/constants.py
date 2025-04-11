@@ -95,6 +95,12 @@ LLAMA4_MAX_POSITION_EMBEDDINGS = 65536
 
 # Gemma3 Constant
 GEMMA3_MAX_POSITION_EMBEDDINGS = 32768
+# MISTRAL3 Constants
+# Fixing the feature size with reference to mistralai/Mistral-Small-3.1-24B-Instruct-2503
+MISTRAL3_FEATURE_SIZE = 2255
+MISTRAL3_NUM_CHANNELS = 3
+MISTRAL3_HEIGHT = 1540
+MISTRAL3_WIDTH = 1162
 
 
 class Constants:
