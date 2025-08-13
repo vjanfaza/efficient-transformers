@@ -96,6 +96,7 @@ class QEffGptOssMLP(GptOssMLP):
 
     # ------------------- Gather based, weights as activation approach ---------------
     def forward(self, hidden_states):
+        # import ipdb; ipdb.set_trace()
         bs, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.view(bs * seq_len, self.experts.hidden_size)
 
@@ -104,7 +105,44 @@ class QEffGptOssMLP(GptOssMLP):
         router_top_value, router_indices = torch.topk(router_logits, self.router.top_k, dim=-1)
         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
 
+        # Prefill Approach
+
+        masked_logits = torch.zeros_like(router_logits)
+        masked_logits.scatter_(1, router_indices, router_top_value)
+        final_out_pref = torch.zeros(bs * seq_len, self.experts.hidden_size)
+        masked_logits_mask = (masked_logits > 0).unsqueeze(-1)
+
+        for i in torch.arange(self.experts.num_experts):
+            gate_up_proj_pref = self.experts.gate_up_proj[i.flatten()].squeeze(0)
+            gate_up_proj_bias_pref = self.experts.gate_up_proj_bias[i.flatten()].squeeze(0)
+            down_proj_pref = self.experts.down_proj[i.flatten()].squeeze(0)
+            down_proj_bias_pref = self.experts.down_proj_bias[i.flatten()].squeeze(0)
+            # Gate and Up projections
+            gate_up_pref = torch.where(
+                masked_logits_mask[:, i, :],
+                torch.mm(hidden_states, gate_up_proj_pref) + gate_up_proj_bias_pref,
+                torch.zeros(bs * seq_len, self.experts.hidden_size * 2),
+            )  # [T, I]
+            gate_pref, up_pref = gate_up_pref[..., ::2], gate_up_pref[..., 1::2]
+
+            # Apply GptOss activation with clamping
+            gate_pref = gate_pref.clamp(min=None, max=self.experts.limit)
+            up_pref = up_pref.clamp(min=-self.experts.limit, max=self.experts.limit)
+
+            # GLU activation
+            glu_pref = gate_pref * torch.sigmoid(gate_pref * self.experts.alpha)
+            intermediate_pref = (up_pref + 1) * glu_pref  # [T, I]
+            down_out_pref = torch.where(
+                masked_logits_mask[:, i, :],
+                torch.mm(intermediate_pref, down_proj_pref) + down_proj_bias_pref,
+                torch.zeros(bs * seq_len, self.experts.hidden_size),
+            )  # [T, H]
+
+            final_out_pref += down_out_pref * masked_logits[:, i].unsqueeze(-1)
+
+        # DECODE Approach
         # GATHER - collect weights for selected experts
+
         gate_up_proj = self.experts.gate_up_proj[router_indices.flatten()]
         gate_up_proj_bias = self.experts.gate_up_proj_bias[router_indices.flatten()]
         down_proj = self.experts.down_proj[router_indices.flatten()]
@@ -136,6 +174,8 @@ class QEffGptOssMLP(GptOssMLP):
         # Apply routing weights AFTER expert computation (This is before on Llama4)
         experts_out = experts_out * router_top_value.unsqueeze(-1)
         experts_out = experts_out.sum(dim=1)
+
+        experts_out = torch.where(torch.tensor(seq_len > 1), final_out_pref, experts_out)
 
         return experts_out, router_logits
 
