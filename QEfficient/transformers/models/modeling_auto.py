@@ -872,6 +872,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             raise NotImplementedError("Continuous batching is not supported for image-text-to-text models yet.")
         self.model = model
         self.config = model.config
+
+        self.comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        self.prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         self.vision_model = QEffVisionEncoderForTextImageToTextModel(model, **kwargs)
         self.lang_model = QEffCausalLMForTextImageToTextModel(model, **kwargs)
         self.input_shapes, self.output_names = None, None
@@ -917,8 +921,17 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             logger.warning("Updating low_cpu_mem_usage=False")
 
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
+        comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        return cls(model, pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+        return cls(
+            model,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            comp_ctx_lengths=comp_ctx_lengths,
+            prefill_ccl_len=prefill_ccl_len,
+            **kwargs,
+        )
 
     @property
     def onnx_path(self):
@@ -973,8 +986,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         List[str]
             A list containing the paths to the generated ONNX graph files for both components.
         """
-        inputs = self.model.get_dummy_inputs(kv_offload=True)
-        dynamic_axes = self.model.get_onnx_dynamic_axes(kv_offload=True)
+        inputs = self.model.get_dummy_inputs(self.comp_ctx_lengths, kv_offload=True)
+        dynamic_axes = self.model.get_onnx_dynamic_axes(self.comp_ctx_lengths, kv_offload=True)
         output_names = self.model.get_output_names(kv_offload=True)
 
         self.vision_model.export(
@@ -1078,6 +1091,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             batch_size=batch_size,
             prefill_seq_len=prefill_seq_len,
             ctx_len=ctx_len,
+            comp_ctx_lengths=self.comp_ctx_lengths,
+            prefill_ccl_len=self.prefill_ccl_len,
             img_size=img_size,
             kv_offload=True,
             **compiler_options,
@@ -1319,8 +1334,24 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         prefill_start = perf_counter()
 
         # Run prefill
+
+        if self.comp_ctx_lengths is not None:
+            list_of_comp_ctx_lengths = [np.zeros(length) for length in self.comp_ctx_lengths]
+            prefill_ccl_id = 0
+            lang_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[prefill_ccl_id]
+
         chunk_inputs = lang_inputs.copy()
         for i in range(num_chunks):
+            if (i + 1) * prefill_seq_len > self.comp_ctx_lengths[prefill_ccl_id]:
+                prefill_ccl_id += 1
+                if prefill_ccl_id >= self.prefill_ccl_len:
+                    prefill_ccl_id = (
+                        (self.prefill_ccl_len - 1)
+                        if self.prefill_ccl_len != 0
+                        else min(prefill_ccl_id, len(self.comp_ctx_lengths) - 1)
+                    )
+                chunk_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[prefill_ccl_id]
+
             chunk_inputs["input_ids"] = lang_inputs["input_ids"][:, i * prefill_seq_len : (i + 1) * prefill_seq_len]
             chunk_inputs["position_ids"] = lang_inputs["position_ids"][
                 :, i * prefill_seq_len : (i + 1) * prefill_seq_len
@@ -1350,8 +1381,24 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             streamer.put(lang_inputs["input_ids"][0])
 
         # Decode loop
+
+        max_ccl_id = len(self.comp_ctx_lengths) - 1
+        max_position_id = np.max(lang_inputs["position_ids"])
+        ccl_id_initial = self.prefill_ccl_len
+        ccl_id = ccl_id_initial
+        for i in range(ccl_id_initial, len(self.comp_ctx_lengths)):
+            if max_position_id < self.comp_ctx_lengths[i]:
+                ccl_id = i
+                break
+        lang_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[ccl_id]
+
         decode_start = perf_counter()
         for num_token in range(1, generation_len):
+            if self.comp_ctx_lengths is not None:
+                if max_position_id >= self.comp_ctx_lengths[ccl_id] - 1:
+                    ccl_id = min(ccl_id + 1, max_ccl_id)
+                    lang_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[ccl_id]
+
             outputs = lang_session.run(lang_inputs)
 
             # Prepare inputs for next iteration
@@ -1422,6 +1469,9 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             raise NotImplementedError("Continuous batching is not supported for image-text-to-text models yet.")
         super().__init__(model, **kwargs)
 
+        self.comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        self.prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         # to handle internvl models
         if hasattr(self.model.config, "llm_config") and hasattr(self.model.config, "vision_config"):
             self.model.config.llm_config.use_cache = True
@@ -1465,6 +1515,10 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             logger.warning("Updating low_cpu_mem_usage=False")
 
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
+
+        comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
@@ -1472,7 +1526,13 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         config.vision_config.use_flash_attn = "false"
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, config, *args, **kwargs)
 
-        return cls(model, pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+        return cls(
+            model,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            comp_ctx_lengths=comp_ctx_lengths,
+            prefill_ccl_len=prefill_ccl_len,
+            **kwargs,
+        )
 
     def export(
         self,
@@ -1494,8 +1554,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         str
             Path to the generated ONNX graph file.
         """
-        inputs = self.model.get_dummy_inputs()
-        dynamic_axes = self.model.get_onnx_dynamic_axes()
+        inputs = self.model.get_dummy_inputs(self.comp_ctx_lengths)
+        dynamic_axes = self.model.get_onnx_dynamic_axes(self.comp_ctx_lengths)
         output_names = self.model.get_output_names()
         return self._export(inputs, output_names, dynamic_axes, export_dir=export_dir)
 
@@ -1577,6 +1637,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             batch_size=batch_size,
             prefill_seq_len=prefill_seq_len,
             ctx_len=ctx_len,
+            comp_ctx_lengths=self.comp_ctx_lengths,
+            prefill_ccl_len=self.prefill_ccl_len,
             img_size=img_size,
             **compiler_options,
         )
@@ -1761,12 +1823,27 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
         inputs["image_idx"] = np.array([[0]])
 
+        if self.comp_ctx_lengths is not None:
+            list_of_comp_ctx_lengths = [np.zeros(length) for length in self.comp_ctx_lengths]
+            prefill_ccl_id = 0
+            inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[prefill_ccl_id]
+
         qpc_session.activate()
         chunk_inputs = inputs.copy()
         prefill_start = perf_counter()
 
         # Run prefill
         for i in range(num_chunks):
+            if (i + 1) * prefill_seq_len > self.comp_ctx_lengths[prefill_ccl_id]:
+                prefill_ccl_id += 1
+                if prefill_ccl_id >= self.prefill_ccl_len:
+                    prefill_ccl_id = (
+                        (self.prefill_ccl_len - 1)
+                        if self.prefill_ccl_len != 0
+                        else min(prefill_ccl_id, len(self.comp_ctx_lengths) - 1)
+                    )
+                chunk_inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[prefill_ccl_id]
+
             chunk_inputs["input_ids"] = inputs["input_ids"][:, i * prefill_seq_len : (i + 1) * prefill_seq_len]
             chunk_inputs["position_ids"] = inputs["position_ids"][:, i * prefill_seq_len : (i + 1) * prefill_seq_len]
             outputs = qpc_session.run(chunk_inputs)
@@ -1790,8 +1867,24 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             inputs.pop("pixel_values")
 
         # Decode loop
+
+        max_ccl_id = len(self.comp_ctx_lengths) - 1
+        max_position_id = np.max(inputs["position_ids"])
+        ccl_id_initial = self.prefill_ccl_len
+        ccl_id = ccl_id_initial
+        for i in range(ccl_id_initial, len(self.comp_ctx_lengths)):
+            if max_position_id < self.comp_ctx_lengths[i]:
+                ccl_id = i
+                break
+        inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[ccl_id]
+
         decode_start = perf_counter()
         for num_token in range(1, generation_len):
+            if self.comp_ctx_lengths is not None:
+                if max_position_id >= self.comp_ctx_lengths[ccl_id] - 1:
+                    ccl_id = min(ccl_id + 1, max_ccl_id)
+                    inputs["comp_ctx_lengths"] = list_of_comp_ctx_lengths[ccl_id]
+
             outputs = qpc_session.run(inputs)
             # Prepare inputs for next iteration
             inputs["input_ids"] = outputs["logits"].argmax(2)
@@ -1929,6 +2022,9 @@ class QEFFAutoModelForImageTextToText:
         Union[_QEffAutoModelForImageTextToTextDualQPC, _QEFFAutoModelForImageTextToTextSingleQPC]
             The wrapped model instance, configured for either dual or single QPC.
         """
+        self.comp_ctx_lengths = kwargs.get("comp_ctx_lengths", None)
+        self.prefill_ccl_len = kwargs.get("prefill_ccl_len", 1)
+
         if kv_offload:
             return _QEffAutoModelForImageTextToTextDualQPC(model, **kwargs)
         else:
@@ -1975,8 +2071,19 @@ class QEFFAutoModelForImageTextToText:
             NotImplementedError("Continuous batching is not supported for image-text-to-text models yet.")
 
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
+
+        comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        return cls(model, kv_offload=kv_offload, pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+        return cls(
+            model,
+            kv_offload=kv_offload,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            comp_ctx_lengths=comp_ctx_lengths,
+            prefill_ccl_len=prefill_ccl_len,
+            **kwargs,
+        )
 
 
 MISCLASSIFIED_CAUSAL_LM_TO_QEFF_AUTO_CLASS_MAP = {"InternVLChatModel": QEFFAutoModelForImageTextToText}
@@ -2072,6 +2179,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         self.model, transformed = SpDTransform.apply(self.model, qaic_config, **kwargs)
         self.is_tlm = transformed
 
+        self.comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        self.prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
 
         # ---Sampling---
@@ -2166,6 +2276,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         kv_offload = kwargs.pop("kv_offload", None)
 
+        comp_ctx_lengths = kwargs.pop("comp_ctx_lengths", None)
+        prefill_ccl_len = kwargs.pop("prefill_ccl_len", 1)
+
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         if qaic_config is not None:
@@ -2175,13 +2288,20 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         if model.__class__.__name__ in MISCLASSIFIED_CAUSAL_LM_TO_QEFF_AUTO_CLASS_MAP:
             return MISCLASSIFIED_CAUSAL_LM_TO_QEFF_AUTO_CLASS_MAP[model.__class__.__name__](
-                model, kv_offload=kv_offload, pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs
+                model,
+                comp_ctx_lengths=comp_ctx_lengths,
+                prefill_ccl_len=prefill_ccl_len,
+                kv_offload=kv_offload,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                **kwargs,
             )
         return cls(
             model,
             continuous_batching=continuous_batching,
             qaic_config=qaic_config,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
+            comp_ctx_lengths=comp_ctx_lengths,
+            prefill_ccl_len=prefill_ccl_len,
             **kwargs,
         )
 
@@ -2231,6 +2351,10 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
         }
+        if self.comp_ctx_lengths is not None:
+            example_inputs["comp_ctx_lengths"] = torch.randint(0, 100, (40,), dtype=torch.long)
+            dynamic_axes["comp_ctx_lengths"] = {0: "comp_ctx_lengths"}
+
         if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
@@ -2376,6 +2500,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         self,
         prefill_seq_len: int = 32,
         ctx_len: int = 128,
+        comp_ctx_lengths: Optional[int] = None,
         batch_size: int = 1,
         kv_cache_batch_size: Optional[int] = None,
         full_batch_size: Optional[int] = None,
@@ -2407,6 +2532,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "ctx_len": ctx_len,
             "num_logits_to_keep": 1 if self.is_tlm else None,
         }
+        if comp_ctx_lengths is not None:
+            spec["comp_ctx_lengths"] = comp_ctx_lengths
+
         if self.continuous_batching:
             spec["full_batch_size"] = kv_cache_batch_size
         else:
@@ -2419,6 +2547,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         self,
         prefill_seq_len: int = 32,
         ctx_len: int = 128,
+        comp_ctx_lengths: Optional[int] = None,
         batch_size: int = 1,
         kv_cache_batch_size: Optional[int] = None,
         full_batch_size: Optional[int] = None,
@@ -2448,7 +2577,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             A dictionary defining the decode specialization, or None if it would be a duplicate
             of the prefill specialization (e.g., if prefill_seq_len is 1 and not continuous batching).
         """
-        if prefill_seq_len == 1 and not self.continuous_batching:
+        if prefill_seq_len == 1 and not self.continuous_batching and comp_ctx_lengths is None:
             return None  # Avoid duplication with prefill
         spec = {
             "batch_size": full_batch_size if self.continuous_batching else batch_size,
@@ -2456,6 +2585,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             "ctx_len": ctx_len,
             "num_logits_to_keep": (num_speculative_tokens + 1) if self.is_tlm else None,
         }
+        if comp_ctx_lengths is not None:
+            spec["comp_ctx_lengths"] = comp_ctx_lengths
 
         if self.continuous_batching:
             spec["full_batch_size"] = kv_cache_batch_size
@@ -2470,6 +2601,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         *,
         prefill_seq_len: int = 32,
         ctx_len: int = 128,
+        comp_ctx_lengths: Optional[List[int]] = None,
+        prefill_ccl_len: Optional[int] = 1,
         batch_size: int = 1,
         full_batch_size: Optional[int] = None,
         kv_cache_batch_size: Optional[int] = None,
@@ -2557,6 +2690,23 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             If `prefill_seq_len` is less than `num_speculative_tokens + 1` for TLM models.
 
         """
+        # For comp_ctx_lengths Disaggregated applications
+        if self.comp_ctx_lengths is None:
+            if comp_ctx_lengths is not None:
+                import ast
+
+                if isinstance(comp_ctx_lengths, str):
+                    try:
+                        # Safely evaluate the string to a Python list for disaggregated input
+                        self.comp_ctx_lengths = ast.literal_eval(comp_ctx_lengths)
+                        self.prefill_ccl_len = prefill_ccl_len
+
+                    except (ValueError, SyntaxError):
+                        raise ValueError("Invalid format for comp_ctx_lengths. Expected a list-like string.")
+                else:
+                    self.comp_ctx_lengths = comp_ctx_lengths
+                    self.prefill_ccl_len = prefill_ccl_len
+
         # --- Validation ---
         if prefill_only is not None and not isinstance(prefill_only, bool):
             raise TypeError("`prefill_only` must be a boolean.")
@@ -2587,26 +2737,60 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         # --- Specializations ---
         specializations = []
         if prefill_only is None or prefill_only or prefill_seq_len == 1:
-            specializations.append(
-                self.build_prefill_specialization(
+            if self.comp_ctx_lengths is not None:
+                if prefill_seq_len != 1 and self.prefill_ccl_len == 0:
+                    raise ValueError("When prefill_seq_len > 1, prefill_ccl_len must be greater than 0.")
+                # Adding elements from self.comp_ctx_lengths to prefill_specialization
+                for i in range(0, self.prefill_ccl_len):
+                    specializations.append(
+                        self.build_prefill_specialization(
+                            prefill_seq_len=prefill_seq_len,
+                            ctx_len=ctx_len,
+                            comp_ctx_lengths=self.comp_ctx_lengths[i],
+                            batch_size=batch_size,
+                            kv_cache_batch_size=kv_cache_batch_size,
+                            full_batch_size=full_batch_size,
+                        )
+                    )
+
+            else:
+                specializations.append(
+                    self.build_prefill_specialization(
+                        prefill_seq_len=prefill_seq_len,
+                        ctx_len=ctx_len,
+                        batch_size=batch_size,
+                        kv_cache_batch_size=kv_cache_batch_size,
+                        full_batch_size=full_batch_size,
+                    )
+                )
+
+        if prefill_only is None or not prefill_only:
+            if self.comp_ctx_lengths is not None:
+                # Adding elements from self.comp_ctx_lengths to decode_specialization
+                for i in range(self.prefill_ccl_len, len(self.comp_ctx_lengths)):
+                    decode_spec = self.build_decode_specialization(
+                        prefill_seq_len=prefill_seq_len,
+                        ctx_len=ctx_len,
+                        comp_ctx_lengths=self.comp_ctx_lengths[i],
+                        batch_size=batch_size,
+                        kv_cache_batch_size=kv_cache_batch_size,
+                        full_batch_size=full_batch_size,
+                        num_speculative_tokens=num_speculative_tokens,
+                    )
+                    if decode_spec:
+                        specializations.append(decode_spec)
+
+            else:
+                decode_spec = self.build_decode_specialization(
                     prefill_seq_len=prefill_seq_len,
                     ctx_len=ctx_len,
                     batch_size=batch_size,
                     kv_cache_batch_size=kv_cache_batch_size,
                     full_batch_size=full_batch_size,
+                    num_speculative_tokens=num_speculative_tokens,
                 )
-            )
-        if prefill_only is None or not prefill_only:
-            decode_spec = self.build_decode_specialization(
-                prefill_seq_len=prefill_seq_len,
-                ctx_len=ctx_len,
-                batch_size=batch_size,
-                kv_cache_batch_size=kv_cache_batch_size,
-                full_batch_size=full_batch_size,
-                num_speculative_tokens=num_speculative_tokens,
-            )
-            if decode_spec:
-                specializations.append(decode_spec)
+                if decode_spec:
+                    specializations.append(decode_spec)
 
         # --- Compilation ---
         kv_cache_dtype = "mxint8" if mxint8_kv_cache else "float16"
@@ -2684,6 +2868,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 tokenizer,
                 self.qpc_path,
                 prompt=prompts,
+                comp_ctx_lengths=self.comp_ctx_lengths,
+                prefill_ccl_len=self.prefill_ccl_len,
                 device_id=device_id,
                 generation_len=generation_len,
                 is_tlm=self.is_tlm,
