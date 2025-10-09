@@ -23,8 +23,8 @@ def run_model(
     kv_offload=False,
     prefill_seq_len=32,
     ctx_len=512,
-    comp_ctx_lengths=None,
-    prefill_ccl_len=1,
+    comp_ctx_lengths_prefill=None,
+    comp_ctx_lengths_decode=None,
     generation_len=128,
     img_size=560,
     num_cores=16,
@@ -43,8 +43,9 @@ def run_model(
         token=token,
         attn_implementation="eager",
         kv_offload=kv_offload,
-        comp_ctx_lengths=comp_ctx_lengths,
-        prefill_ccl_len=prefill_ccl_len,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+        ctx_len=ctx_len,
     )
 
     ## STEP - 2 Export & Compile the Model
@@ -90,7 +91,8 @@ def run_model(
 
 if __name__ == "__main__":
     # Model name and Input parameters
-    model_name = "llava-hf/llava-1.5-7b-hf"
+    # model_name = "llava-hf/llava-1.5-7b-hf"
+    model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
     query = "Describe this image."
     image_url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg"
 
@@ -99,11 +101,12 @@ if __name__ == "__main__":
     prefill_seq_len = 32
     ctx_len = 8192
     generation_len = 128
-    img_size = 336
+    # img_size = 336
+    img_size = 560
     num_cores = 16
     num_devices = 4
-    comp_ctx_lengths = [4096, 6144, 8192]
-    prefill_ccl_len = 1
+    comp_ctx_lengths_prefill = [4096]
+    comp_ctx_lengths_decode = [6144, ctx_len]
 
     run_model(
         model_name=model_name,
@@ -113,8 +116,8 @@ if __name__ == "__main__":
         image_url=image_url,
         prefill_seq_len=prefill_seq_len,
         ctx_len=ctx_len,
-        comp_ctx_lengths=comp_ctx_lengths,
-        prefill_ccl_len=prefill_ccl_len,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
         generation_len=generation_len,
         img_size=img_size,
         num_cores=num_cores,

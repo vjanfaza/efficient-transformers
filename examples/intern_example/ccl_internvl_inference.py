@@ -180,18 +180,18 @@ def run_intern_on_aic(
     # The original Intern-VL model, despite being multimodal, is loaded using `AutoModelForCausalLM` in Huggingface.
     # To maintain compatibility, we load this model using `QEFFAutoModelForCausalLM`.
 
-    comp_ctx_lengths = [4096, 6144, 8192]
     ctx_len = 8192
-    prefill_ccl_len = 1
-    device_id = [28, 29, 30, 31]
+    comp_ctx_lengths_prefill = [4096]
+    comp_ctx_lengths_decode = [6144, ctx_len]
 
     # model = QEFFAutoModelForCausalLM.from_pretrained(model_name, kv_offload=kv_offload, trust_remote_code=True)
 
     model = QEFFAutoModelForCausalLM.from_pretrained(
         model_name,
         kv_offload=kv_offload,
-        comp_ctx_lengths=comp_ctx_lengths,
-        prefill_ccl_len=prefill_ccl_len,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+        ctx_len=ctx_len,
         trust_remote_code=True,
     )
 
@@ -231,7 +231,7 @@ def run_intern_on_aic(
 
     ## STEP 5 -- RUN INFERENCE VIA GENERATE FUNCTION
     streamer = TextStreamer(tokenizer)
-    model.generate(inputs=inputs, streamer=streamer, device_ids=device_id, generation_len=128)
+    model.generate(inputs=inputs, streamer=streamer, generation_len=128)
 
 
 if __name__ == "__main__":

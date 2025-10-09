@@ -115,8 +115,17 @@ def test_causal_lm_hash(config, cb):
 @pytest.mark.parametrize("config", configs, ids=config_ids)
 def test_causal_lm_export(config, cb, tmp_path):
     model = AutoModelForCausalLM.from_config(config, **model_kwargs)
-    comp_ctx_lengths = [512, 1024, 2048]
-    qeff_model = QEFFAutoModelForCausalLM(model, cb, comp_ctx_lengths=comp_ctx_lengths)
+    ctx_len = 2048
+    comp_ctx_lengths_prefill = [256]
+    comp_ctx_lengths_decode = [512, 1024, ctx_len]
+
+    qeff_model = QEFFAutoModelForCausalLM(
+        model,
+        cb,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+        ctx_len=ctx_len,
+    )
     qeff_model.export(tmp_path)
     model_path = tmp_path.with_name(tmp_path.name + "-" + qeff_model.model_hash)
     assert model_path.is_dir()
@@ -148,9 +157,17 @@ def tmp_cache(tmp_path, monkeypatch):
 @pytest.mark.parametrize("config", configs, ids=config_ids)
 def test_causal_lm_compile(config, cb, tmp_cache):
     model = AutoModelForCausalLM.from_config(config, **model_kwargs)
-    comp_ctx_lengths = [8, 12, 16]
-    qeff_model = QEFFAutoModelForCausalLM(model, cb, comp_ctx_lengths=comp_ctx_lengths)
-    compile_params = {"prefill_seq_len": 8, "ctx_len": 16}
+    ctx_len = 2048
+    comp_ctx_lengths_prefill = [256]
+    comp_ctx_lengths_decode = [512, 1024, ctx_len]
+    qeff_model = QEFFAutoModelForCausalLM(
+        model,
+        cb,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+        ctx_len=ctx_len,
+    )
+    compile_params = {"prefill_seq_len": 8, "ctx_len": ctx_len}
     if cb:
         compile_params["full_batch_size"] = 32
         compile_params["batch_size"] = 8

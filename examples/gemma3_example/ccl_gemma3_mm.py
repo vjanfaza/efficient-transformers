@@ -12,7 +12,7 @@ from transformers import AutoConfig, AutoProcessor
 from QEfficient import QEFFAutoModelForImageTextToText
 
 # Change model_id to "google/gemma-3-27b-it" for 27B model
-model_id = "google/gemma-3-27b-it"
+model_id = "google/gemma-3-4b-it"
 config = AutoConfig.from_pretrained(model_id)
 # For Testing Purpose Only
 # config.text_config.num_hidden_layers = 1
@@ -22,16 +22,18 @@ processor = AutoProcessor.from_pretrained(model_id)
 
 # pass HF_TOKEN if gated model
 # For running the model in single QPC approach use kv_offload=False. For Dual QPC approach use kv_offload=True ###
-comp_ctx_lengths = [3072, 4096, 6144, 8192]
 ctx_len = 8192
-prefill_ccl_len = 1
+comp_ctx_lengths_prefill = [3072]
+comp_ctx_lengths_decode = [4096, 6144, ctx_len]
+
 qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
     model_id,
     config=config,
     attn_implementation="eager",
     kv_offload=True,
-    comp_ctx_lengths=comp_ctx_lengths,
-    prefill_ccl_len=prefill_ccl_len,
+    comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+    comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+    ctx_len=ctx_len,
 )
 
 ### use skip_vision=Ture, if want to run only text, or false ###

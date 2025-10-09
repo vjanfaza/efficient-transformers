@@ -908,8 +908,8 @@ class QEffLlama4ForConditionalGeneration(Llama4ForConditionalGeneration):
         prefill_seq_len: int,
         ctx_len: int,
         img_size: int,
-        comp_ctx_lengths: List[int] = None,
-        prefill_ccl_len: int = None,
+        comp_ctx_lengths_prefill: List[int] = None,
+        comp_ctx_lengths_decode: List[int] = None,
         kv_offload: bool = False,
         **compiler_options,
     ):
@@ -959,17 +959,16 @@ class QEffLlama4ForConditionalGeneration(Llama4ForConditionalGeneration):
                 "img_size": img_size,
             }
         ]
-        if comp_ctx_lengths is not None:
+        if comp_ctx_lengths_prefill is not None:
             lang = []
 
-            # prefill_ccl_len elements of comp_ctx_lengths will be used for prefilling
-            for i in range(0, prefill_ccl_len):
+            for i in range(0, len(comp_ctx_lengths_prefill)):
                 lang.append(
                     {
                         "batch_size": batch_size,
                         "seq_len": prefill_seq_len,
                         "ctx_len": ctx_len,
-                        "comp_ctx_lengths": comp_ctx_lengths[i],
+                        "comp_ctx_lengths": comp_ctx_lengths_prefill[i],
                         "max_num_tiles": max_num_tiles,
                         "img_size": img_size,
                         "vision_size": vision_size,
@@ -978,14 +977,13 @@ class QEffLlama4ForConditionalGeneration(Llama4ForConditionalGeneration):
                     }
                 )
 
-            # Remaining elements use comp_ctx_lengths[1:] in a loop
-            for i in range(prefill_ccl_len, len(comp_ctx_lengths)):
+            for i in range(0, len(comp_ctx_lengths_decode)):
                 lang.append(
                     {
                         "batch_size": batch_size,
                         "seq_len": "1",
                         "ctx_len": ctx_len,
-                        "comp_ctx_lengths": comp_ctx_lengths[i],
+                        "comp_ctx_lengths": comp_ctx_lengths_decode[i],
                         "max_num_tiles": max_num_tiles,
                         "img_size": img_size,
                         "vision_size": vision_size,

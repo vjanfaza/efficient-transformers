@@ -16,15 +16,17 @@ from QEfficient import QEFFAutoModelForCausalLM
 ##       - During the decoding process, based on the position_id or cache index it will work with the specific compute-context-length in the list. It will start from a proper compute-context-length in the list based on input prompt length and will gradually increase the compute-context-length if the cache index passes the current compute-context-length. ##
 
 
-comp_ctx_lengths = [192, 256, 512, 1024]  # None
+ctx_len = 2048
+comp_ctx_lengths_prefill = [256]
+comp_ctx_lengths_decode = [512, 1024, ctx_len]
 
-## Prefill_ccl_len shows how many numbers in the comp_ctx_lengths list is related to prefilling and the rest would be for decoding. The default value is 1.
-prefill_ccl_len = 2
-ctx_len = 1024
-
-model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+model_name = "Qwen/Qwen2.5-7B"
 model = QEFFAutoModelForCausalLM.from_pretrained(
-    model_name, continuous_batching=True, comp_ctx_lengths=comp_ctx_lengths, prefill_ccl_len=prefill_ccl_len
+    model_name,
+    continuous_batching=True,
+    comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+    comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+    ctx_len=ctx_len,
 )
 
 # model compilation for either continuous or static batching. For continuous batching full_batch_size is needed.

@@ -23,12 +23,16 @@ tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_co
 processor = AutoProcessor.from_pretrained(model_id)
 
 ### For running the model in single QPC approach use kv_offload=False. For Dual QPC approach use kv_offload=True ###
-comp_ctx_lengths = [3072, 4096, 6144, 8192]
 ctx_len = 8192
-prefill_ccl_len = 1
-device_id = [32, 33, 34, 35]
+comp_ctx_lengths_prefill = [3072]
+comp_ctx_lengths_decode = [4096, 6144, ctx_len]
+
 qeff_model = QEFFAutoModelForImageTextToText(
-    model, kv_offload=False, comp_ctx_lengths=comp_ctx_lengths, prefill_ccl_len=prefill_ccl_len
+    model,
+    kv_offload=False,
+    comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+    comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+    ctx_len=ctx_len,
 )
 
 ### use skip_vision=Ture, if want to run only text, ow false ###
@@ -71,7 +75,7 @@ if skip_vision:
     )
 
     streamer = TextStreamer(tokenizer)
-    output = qeff_model.generate(inputs=inputs, device_ids=device_id, generation_len=700)
+    output = qeff_model.generate(inputs=inputs, generation_len=700)
     print(output.generated_ids)
     print(tokenizer.batch_decode(output.generated_ids))
     print(output)
@@ -115,7 +119,7 @@ else:
     )
     inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
     streamer = TextStreamer(tokenizer)
-    output = qeff_model.generate(inputs=inputs, device_ids=device_id, generation_len=1024)
+    output = qeff_model.generate(inputs=inputs, generation_len=1024)
     print(output.generated_ids)
     print(tokenizer.batch_decode(output.generated_ids))
     print(output)

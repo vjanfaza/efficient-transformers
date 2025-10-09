@@ -23,8 +23,8 @@ def run_model(
     kv_offload=False,
     prefill_seq_len=5500,
     ctx_len=6000,
-    comp_ctx_lengths=None,
-    prefill_ccl_len=1,
+    comp_ctx_lengths_prefill=None,
+    comp_ctx_lengths_decode=None,
     generation_len=128,
     img_size=384,
     num_cores=16,
@@ -43,8 +43,9 @@ def run_model(
         model_name,
         token=token,
         kv_offload=kv_offload,
-        comp_ctx_lengths=comp_ctx_lengths,
-        prefill_ccl_len=prefill_ccl_len,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
+        ctx_len=ctx_len,
     )
 
     ## STEP - 2 Export & Compile the Model
@@ -95,8 +96,9 @@ if __name__ == "__main__":
     img_size = 384
     num_cores = 16
     num_devices = 4
-    comp_ctx_lengths = [5500, 6144, 8192]
-    prefill_ccl_len = 1
+    ctx_len = 8192
+    comp_ctx_lengths_prefill = [5500]
+    comp_ctx_lengths_decode = [6144, ctx_len]
 
     run_model(
         model_name=model_name,
@@ -106,8 +108,8 @@ if __name__ == "__main__":
         image_url=image_url,
         prefill_seq_len=prefill_seq_len,
         ctx_len=ctx_len,
-        comp_ctx_lengths=comp_ctx_lengths,
-        prefill_ccl_len=prefill_ccl_len,
+        comp_ctx_lengths_prefill=comp_ctx_lengths_prefill,
+        comp_ctx_lengths_decode=comp_ctx_lengths_decode,
         generation_len=generation_len,
         img_size=img_size,
         num_cores=num_cores,
