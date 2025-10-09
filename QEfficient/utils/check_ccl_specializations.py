@@ -7,14 +7,17 @@
 
 from typing import List, Optional
 
-def process_ccl_specializations(ccl_prefill: Optional[List[int]]=None, ccl_decode: Optional[List[int]]=None, ctx_len: Optional[int]=None):
+
+def process_ccl_specializations(
+    ccl_prefill: Optional[List[int]] = None, ccl_decode: Optional[List[int]] = None, ctx_len: Optional[int] = None
+):
     if ctx_len is None:
         raise TypeError("`ctx_len` is required when loading the model.")
     if ccl_prefill is None:
         ccl_prefill = [ctx_len]
     if ccl_decode is None:
         ccl_decode = [ctx_len]
-        
+
     # Step 1: Cap values to ctx_len
     ccl_prefill = [min(x, ctx_len) for x in ccl_prefill]
     ccl_decode = [min(x, ctx_len) for x in ccl_decode]
