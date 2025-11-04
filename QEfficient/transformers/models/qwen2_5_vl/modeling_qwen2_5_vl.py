@@ -6,6 +6,7 @@
 # -----------------------------------------------------------------------------
 
 import math
+import os
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -360,6 +361,79 @@ class QEffQwen2_5_VLRotaryEmbedding(Qwen2_5_VLRotaryEmbedding):
         )
 
 
+def eager_attention_forward_q_blocked(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    **kwargs,
+):
+    """
+    Q-blocked attention for Qwen2.5-VL.
+    Blocks only the query SL dimension.
+
+    Args:
+        query: (BS, NH, Q_LEN, DH)
+        key: (BS, NH_KV, KV_LEN, DH)
+        value: (BS, NH_KV, KV_LEN, DH)
+        attention_mask: (BS, NH, Q_LEN, KV_LEN) or broadcastable
+    """
+    BS, NH, Q_LEN, DH = query.shape
+    _, _, KV_LEN, _ = key.shape
+
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    target_blocks_q = int(os.environ.get("num_q_blocks", Q_LEN))
+    q_block_positions = [(i * Q_LEN) // target_blocks_q for i in range(target_blocks_q)]
+    scaling = 1.0 / math.sqrt(module.head_dim)
+
+    q_output_blocks = []
+    q_attn_weights_blocks = []
+
+    # Process each Q block
+    for q_block_idx in range(target_blocks_q):
+        qi = q_block_positions[q_block_idx]
+
+        # Calculate Q block size
+        if q_block_idx == target_blocks_q - 1:
+            real_q_len = Q_LEN - qi
+        else:
+            real_q_len = q_block_positions[q_block_idx + 1] - qi
+
+        # Extract Q block
+        q_block = query[:, :, qi : qi + real_q_len, :]
+        attn_mask_block = None
+        if attention_mask is not None:
+            attn_mask_block = attention_mask[:, :, qi : qi + real_q_len, :]
+
+        # Compute attention scores for this Q block
+        attn_weights = torch.matmul(q_block, key_states.transpose(2, 3)) * scaling
+        if attn_mask_block is not None:
+            attn_weights = torch.where(
+                attn_mask_block,
+                torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32, device=attn_weights.device),
+                attn_weights,
+            )
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        # Compute output for this Q block
+        output_block = torch.matmul(attn_weights, value_states)
+
+        q_output_blocks.append(output_block)
+        q_attn_weights_blocks.append(attn_weights)
+
+    attn_output = torch.cat(q_output_blocks, dim=2)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    # Concatenate attention weights
+    attn_weights = torch.cat(q_attn_weights_blocks, dim=2)
+
+    return attn_output, attn_weights
+
+
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -368,20 +442,32 @@ def eager_attention_forward(
     attention_mask: Optional[torch.Tensor],
     **kwargs,
 ):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    """
+    Wrapper that routes to blocked or default attention based on environment variable.
+    """
+    blocking_mode = os.environ.get("ATTENTION_BLOCKING_MODE", "default").lower()
 
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) / math.sqrt(module.head_dim)
-    if attention_mask is not None:
-        attn_weights = torch.where(
-            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
-        )
+    if blocking_mode == "q":
+        return eager_attention_forward_q_blocked(module, query, key, value, attention_mask, **kwargs)
+    elif blocking_mode == "default":
+        # Original implementation
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) / math.sqrt(module.head_dim)
 
-    return attn_output, attn_weights
+        if attention_mask is not None:
+            attn_weights = torch.where(
+                attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
+            )
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, attn_weights
+    else:
+        raise ValueError(f"Invalid ATTENTION_BLOCKING_MODE: {blocking_mode}. Must be 'q' or 'default'")
 
 
 class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
@@ -399,7 +485,6 @@ class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -426,16 +511,8 @@ class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
         )
 
         if past_key_value is not None:
-            if comp_ctx_lengths is not None:
-                attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "batch_index": batch_index,
-                "position_ids": position_ids[0],
-                "CCL": attention_mask.shape[-1],
-            }
+            cache_kwargs = {"sin": sin, "cos": cos, "batch_index": batch_index, "position_ids": position_ids[0]}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
@@ -466,7 +543,6 @@ class QEffQwen2_5_VLDecoderLayer(Qwen2_5_VLDecoderLayer):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -506,7 +582,6 @@ class QEffQwen2_5_VLDecoderLayer(Qwen2_5_VLDecoderLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            comp_ctx_lengths=comp_ctx_lengths,
             batch_index=batch_index,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -539,7 +614,6 @@ class QEffQwen2_5_VLTextModel(Qwen2_5_VLTextModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -590,7 +664,6 @@ class QEffQwen2_5_VLTextModel(Qwen2_5_VLTextModel):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
-                comp_ctx_lengths=comp_ctx_lengths,
                 batch_index=batch_index,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
@@ -629,7 +702,6 @@ class QEffQwen2_5_VLModel(Qwen2_5_VLModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -653,7 +725,6 @@ class QEffQwen2_5_VLModel(Qwen2_5_VLModel):
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            comp_ctx_lengths=comp_ctx_lengths,
             batch_index=batch_index,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -702,7 +773,7 @@ class QEffQwen_2_5_vl_DecoderWrapper(nn.Module):
         position_ids,
         image_idx,
         past_key_values,
-        comp_ctx_lengths: Optional[List[int]] = None,
+        batch_index: Optional[torch.LongTensor] = None,
     ):
         inputs_embeds = self.model.get_input_embeddings()(input_ids)
         B, N, C = inputs_embeds.shape
@@ -717,7 +788,7 @@ class QEffQwen_2_5_vl_DecoderWrapper(nn.Module):
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            comp_ctx_lengths=comp_ctx_lengths,
+            batch_index=batch_index,
             use_cache=True,
         )
 
@@ -736,7 +807,7 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
     def get_qeff_language_decoder(self):
         return QEffQwen_2_5_vl_DecoderWrapper(self)
 
-    def get_dummy_inputs(self, comp_ctx_lengths: Optional[List[int]] = None, kv_offload: bool = False, **kwargs):
+    def get_dummy_inputs(self, kv_offload: bool = False, continuous_batching: bool = False, **kwargs):
         inputs_shapes = {}
         inputs_shapes["input_ids"] = (constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
 
@@ -772,10 +843,14 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             .repeat(4, 1, 1)
         )
         lang_inputs["image_idx"] = torch.zeros((inputs_shapes["image_idx"]), dtype=torch.int64)
+
+        bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
+
         # Add data for KV
         kv_cache_shape = get_padding_shape_from_config(
-            config=self.model.config,
-            batch_size=constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
+            config=self.model.config.text_config,
+            batch_size=fbs if continuous_batching else bs,
             seq_len=constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN,
         )
 
@@ -784,8 +859,8 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             for kv in ["key", "value"]:
                 lang_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
 
-        if comp_ctx_lengths is not None:
-            lang_inputs["comp_ctx_lengths"] = torch.randint(0, 100, (40,), dtype=torch.long)
+        if continuous_batching:
+            lang_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
 
         inputs = {}
         if kv_offload:
@@ -805,9 +880,11 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         img_size: None,
         height: int = None,
         width: int = None,
-        comp_ctx_lengths_prefill: Optional[List[int]] = None,
-        comp_ctx_lengths_decode: Optional[List[int]] = None,
+        num_frames: int = 1,
         kv_offload: bool = False,
+        continuous_batching: bool = False,
+        kv_cache_batch_size: Optional[int] = None,
+        full_batch_size: Optional[int] = None,
         **compiler_options,
     ):
         if height is None or width is None:
@@ -888,46 +965,37 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 "grid_w": grid_w,
             }
         ]
-        if comp_ctx_lengths_prefill is not None:
-            lang = []
+        lang_prefill = {
+            "batch_size": 1 if continuous_batching else batch_size,
+            "seq_len": prefill_seq_len,
+            "ctx_len": ctx_len,
+            "vision_size": vision_size,
+            "vision_batch_size": batch_size,
+        }
 
-            for i in range(0, len(comp_ctx_lengths_prefill)):
-                lang.append(
-                    {
-                        "batch_size": batch_size,
-                        "seq_len": prefill_seq_len,
-                        "ctx_len": ctx_len,
-                        "vision_size": vision_size,
-                        "comp_ctx_lengths": comp_ctx_lengths_prefill[i],
-                    }
-                )
-
-            for i in range(0, len(comp_ctx_lengths_decode)):
-                lang.append(
-                    {
-                        "batch_size": batch_size,
-                        "seq_len": "1",
-                        "ctx_len": ctx_len,
-                        "vision_size": vision_size,
-                        "comp_ctx_lengths": comp_ctx_lengths_decode[i],
-                    }
-                )
-
+        if continuous_batching:
+            lang_prefill["full_batch_size"] = kv_cache_batch_size
         else:
-            lang = [
-                {
-                    "batch_size": batch_size,
-                    "seq_len": prefill_seq_len,
-                    "ctx_len": ctx_len,
-                    "vision_size": vision_size,
-                },
-                {
-                    "batch_size": batch_size,
-                    "seq_len": "1",
-                    "ctx_len": ctx_len,
-                    "vision_size": vision_size,
-                },
-            ]
+            lang_prefill["batch_size"] = kv_cache_batch_size
+        if full_batch_size:
+            lang_prefill["full_batch_exec_size"] = full_batch_size
+
+        lang_decode = {
+            "batch_size": full_batch_size if continuous_batching else batch_size,
+            "seq_len": 1,
+            "ctx_len": ctx_len,
+            "vision_size": vision_size,
+            "vision_batch_size": batch_size,
+        }
+
+        if continuous_batching:
+            lang_decode["full_batch_size"] = kv_cache_batch_size
+        else:
+            lang_decode["batch_size"] = kv_cache_batch_size
+
+        lang = []
+        lang.append(lang_prefill)
+        lang.append(lang_decode)
 
         specializations = {}
 
@@ -936,9 +1004,11 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             specializations["lang"] = lang
             return specializations, compiler_options
         else:
+            lang[0].pop("vision_size")
+            lang[1].pop("vision_size")
             return lang, compiler_options
 
-    def get_onnx_dynamic_axes(self, comp_ctx_lengths: Optional[List[int]] = None, kv_offload: bool = False):
+    def get_onnx_dynamic_axes(self, kv_offload: bool = False, continuous_batching: bool = False):
         # Define dynamic axes
         num_layers = self.config.text_config.num_hidden_layers
 
@@ -950,15 +1020,21 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         lang_dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {1: "batch_size", 2: "seq_len"},
-            "vision_embeds": {0: "batch_size", 1: "vision_size"},
+            "vision_embeds": {0: "vision_batch_size", 1: "vision_size"},
         }
 
         for i in range(num_layers):
-            lang_dynamic_axes[f"past_key.{i}"] = {0: "batch_size", 2: "ctx_len"}
-            lang_dynamic_axes[f"past_value.{i}"] = {0: "batch_size", 2: "ctx_len"}
+            lang_dynamic_axes[f"past_key.{i}"] = {
+                0: "full_batch_size" if continuous_batching else "batch_size",
+                2: "ctx_len",
+            }
+            lang_dynamic_axes[f"past_value.{i}"] = {
+                0: "full_batch_size" if continuous_batching else "batch_size",
+                2: "ctx_len",
+            }
 
-        if comp_ctx_lengths is not None:
-            lang_dynamic_axes["comp_ctx_lengths"] = {0: "comp_ctx_lengths"}
+        if continuous_batching:
+            lang_dynamic_axes["batch_index"] = {0: "batch_size"}
 
         dynamic_axes = {}
 
