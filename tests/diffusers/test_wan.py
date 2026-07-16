@@ -7,21 +7,18 @@
 """
 Test for wan pipeline
 # TODO : 1. Add pytest for call method
-         2. See if we reduce height and width
-        3. Keep test for Sub fn as default once sdk supports
 """
 
+import copy
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import pytest
-import safetensors.torch
 import torch
-from diffusers import WanPipeline
-from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_lora_to_diffusers
+from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanPipeline, WanTransformer3DModel
 from diffusers.utils import export_to_video
-from huggingface_hub import hf_hub_download
+from transformers import T5TokenizerFast, UMT5EncoderModel
 
 from QEfficient import QEffWanPipeline
 from QEfficient.diffusers.pipelines.pipeline_utils import (
@@ -32,18 +29,26 @@ from QEfficient.diffusers.pipelines.pipeline_utils import (
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils import constants
 from QEfficient.utils._utils import load_json
-from tests.diffusers.diffusers_utils import DiffusersTestUtils, MADValidator
+from tests.diffusers.diffusers_utils import (
+    DiffusersTestUtils,
+    MADValidator,
+    release_pipeline_qpc_sessions,
+    release_qpc_session,
+)
 
-# Test Configuration for 192x320 resolution with 1 layer
+# Test Configuration for 48 x 64 resolution with 1 layer
 CONFIG_PATH = "tests/diffusers/wan_test_config.json"
+NON_UNIFIED_CONFIG_PATH = "tests/diffusers/wan_test_non_unified_config.json"
 INITIAL_TEST_CONFIG = load_json(CONFIG_PATH)
+NON_UNIFIED_TEST_CONFIG = load_json(NON_UNIFIED_CONFIG_PATH)
+TEST_SEED = 42
 
 
 def wan_pipeline_call_with_mad_validation(
     pipeline,
     pytorch_pipeline,
-    height: int = 192,
-    width: int = 320,
+    height: int = 48,
+    width: int = 64,
     num_frames: int = 81,
     prompt: Union[str, List[str]] = None,
     negative_prompt: Union[str, List[str]] = None,
@@ -64,6 +69,8 @@ def wan_pipeline_call_with_mad_validation(
     custom_config_path: Optional[str] = None,
     use_onnx_subfunctions: bool = False,
     parallel_compile: bool = True,
+    cache_threshold_high: Optional[float] = None,
+    cache_threshold_low: Optional[float] = None,
     mad_tolerances: Dict[str, float] = None,
 ):
     """
@@ -163,7 +170,10 @@ def wan_pipeline_call_with_mad_validation(
         device=device,
     )
 
-    transformer_dtype = pipeline.transformer.model.transformer_high.dtype
+    if pipeline.use_unified:
+        transformer_dtype = pipeline.transformer.model.transformer_high.dtype
+    else:
+        transformer_dtype = pipeline.transformer_high.model.dtype
     prompt_embeds = prompt_embeds.to(transformer_dtype)
     pytorch_prompt_embeds = pytorch_prompt_embeds.to(transformer_dtype)
     if negative_prompt_embeds is not None:
@@ -173,9 +183,10 @@ def wan_pipeline_call_with_mad_validation(
     # Step 5: Prepare timesteps
     pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = pipeline.scheduler.timesteps
+    reference_scheduler = copy.deepcopy(pipeline.scheduler)
 
     # Step 6: Prepare latent variables
-    num_channels_latents = pipeline.transformer.model.config.in_channels
+    num_channels_latents = pipeline.model.transformer.config.in_channels
     latents = pipeline.model.prepare_latents(
         batch_size * num_videos_per_prompt,
         num_channels_latents,
@@ -189,21 +200,48 @@ def wan_pipeline_call_with_mad_validation(
     )
 
     mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+    latents_torch = latents.clone()
 
-    # Step 7: Setup transformer inference session
-    if pipeline.transformer.qpc_session is None:
-        pipeline.transformer.qpc_session = QAICInferenceSession(
-            str(pipeline.transformer.qpc_path), device_ids=pipeline.transformer.device_ids
-        )
-
-    output_buffer = {
-        "output": np.random.rand(
-            batch_size,
-            pipeline.cl,
-            constants.WAN_DIT_OUT_CHANNELS,
-        ).astype(np.int32),
-    }
-    pipeline.transformer.qpc_session.set_buffers(output_buffer)
+    # Step 7: Setup transformer inference session(s)
+    output_buffer = {"output": np.zeros((batch_size, pipeline.cl, constants.WAN_DIT_OUT_CHANNELS), dtype=np.int32)}
+    if pipeline.use_unified:
+        if pipeline.transformer.qpc_session is None:
+            pipeline.transformer.qpc_session = QAICInferenceSession(
+                str(pipeline.transformer.qpc_path), device_ids=pipeline.transformer.device_ids
+            )
+        pipeline.transformer.qpc_session.set_buffers(output_buffer)
+    else:
+        if pipeline.transformer_high.qpc_session is None:
+            pipeline.transformer_high.qpc_session = QAICInferenceSession(
+                str(pipeline.transformer_high.qpc_path), device_ids=pipeline.transformer_high.device_ids
+            )
+        if pipeline.transformer_low.qpc_session is None:
+            pipeline.transformer_low.qpc_session = QAICInferenceSession(
+                str(pipeline.transformer_low.qpc_path), device_ids=pipeline.transformer_low.device_ids
+            )
+        pipeline.transformer_high.qpc_session.set_buffers(output_buffer)
+        pipeline.transformer_low.qpc_session.set_buffers(output_buffer)
+        if getattr(pipeline, "enable_first_block_cache", False):
+            pipeline.transformer_high.qpc_session.skip_buffers(
+                [
+                    tensor_name
+                    for tensor_name in (
+                        pipeline.transformer_high.qpc_session.input_names
+                        + pipeline.transformer_high.qpc_session.output_names
+                    )
+                    if tensor_name.startswith("prev_") or tensor_name.endswith("_RetainedState")
+                ]
+            )
+            pipeline.transformer_low.qpc_session.skip_buffers(
+                [
+                    tensor_name
+                    for tensor_name in (
+                        pipeline.transformer_low.qpc_session.input_names
+                        + pipeline.transformer_low.qpc_session.output_names
+                    )
+                    if tensor_name.startswith("prev_") or tensor_name.endswith("_RetainedState")
+                ]
+            )
     transformer_perf = []
 
     # Step 8: Denoising loop with transformer MAD validation
@@ -213,6 +251,7 @@ def wan_pipeline_call_with_mad_validation(
         boundary_timestep = None
 
     num_warmup_steps = len(timesteps) - num_inference_steps * pipeline.scheduler.order
+    low_stage_counter = 0
 
     with pipeline.model.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
@@ -224,16 +263,27 @@ def wan_pipeline_call_with_mad_validation(
             # Determine which transformer to use (high or low noise)
             if boundary_timestep is None or t >= boundary_timestep:
                 # High-noise stage
-                current_model = pipeline.transformer.model.transformer_high
                 pytorch_current_model = pytorch_pipeline.transformer
-                model_type = torch.ones(1, dtype=torch.int64)
-                model_name = "transformer_high"
+                if pipeline.use_unified:
+                    current_model = pipeline.transformer.model.transformer_high
+                    current_qpc_session = pipeline.transformer.qpc_session
+                    model_type = torch.ones(1, dtype=torch.int64)
+                else:
+                    current_model = pipeline.transformer_high.model
+                    current_qpc_session = pipeline.transformer_high.qpc_session
+                    model_type = None
             else:
                 # Low-noise stage
-                current_model = pipeline.transformer.model.transformer_low
                 pytorch_current_model = pytorch_pipeline.transformer_2
-                model_type = torch.ones(2, dtype=torch.int64)
-                model_name = "transformer_low"
+                if pipeline.use_unified:
+                    current_model = pipeline.transformer.model.transformer_low
+                    current_qpc_session = pipeline.transformer.qpc_session
+                    model_type = torch.ones(2, dtype=torch.int64)
+                else:
+                    current_model = pipeline.transformer_low.model
+                    current_qpc_session = pipeline.transformer_low.qpc_session
+                    model_type = None
+                    low_stage_counter += 1
 
             latent_model_input = latents.to(transformer_dtype)
             if pipeline.model.config.expand_timesteps:
@@ -242,37 +292,47 @@ def wan_pipeline_call_with_mad_validation(
             else:
                 timestep = t.expand(latents.shape[0])
 
-            batch_size, num_channels, num_frames, height, width = latents.shape
+            batch_size, num_channels, latent_num_frames, latent_height, latent_width = latents.shape
             p_t, p_h, p_w = current_model.config.patch_size
-            post_patch_num_frames = num_frames // p_t
-            post_patch_height = height // p_h
-            post_patch_width = width // p_w
+            post_patch_num_frames = latent_num_frames // p_t
+            post_patch_height = latent_height // p_h
+            post_patch_width = latent_width // p_w
 
             # Prepare transformer inputs
-            rotary_emb = current_model.rope(latent_model_input)
+            rotary_emb = pytorch_current_model.rope(latent_model_input)
             rotary_emb = torch.cat(rotary_emb, dim=0)
             ts_seq_len = None
             timestep = timestep.flatten()
 
-            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = current_model.condition_embedder(
-                timestep, prompt_embeds, encoder_hidden_states_image=None, timestep_seq_len=ts_seq_len
+            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
+                pytorch_current_model.condition_embedder(
+                    timestep, prompt_embeds, encoder_hidden_states_image=None, timestep_seq_len=ts_seq_len
+                )
             )
 
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
             # Prepare inputs for QAIC inference
             inputs_aic = {
-                "hidden_states": latents.detach().numpy(),
+                "hidden_states": latent_model_input.detach().numpy(),
                 "encoder_hidden_states": encoder_hidden_states.detach().numpy(),
                 "rotary_emb": rotary_emb.detach().numpy(),
                 "temb": temb.detach().numpy(),
                 "timestep_proj": timestep_proj.detach().numpy(),
-                "tsp": model_type.detach().numpy(),
             }
+            if model_type is not None:
+                inputs_aic["tsp"] = model_type.detach().numpy()
+            if getattr(pipeline, "enable_first_block_cache", False):
+                if boundary_timestep is None or t >= boundary_timestep:
+                    stage_cache_threshold = 0.0 if cache_threshold_high is None else cache_threshold_high
+                else:
+                    low_threshold = 0.0 if cache_threshold_low is None else cache_threshold_low
+                    stage_cache_threshold = 0.0 if low_stage_counter < 3 else low_threshold
+                inputs_aic["cache_threshold"] = np.array(stage_cache_threshold, dtype=np.float32)
 
             # PyTorch reference inference (standard WAN transformer has different signature)
             noise_pred_torch = pytorch_current_model(
-                hidden_states=latent_model_input,
+                hidden_states=latents_torch.to(transformer_dtype),
                 timestep=timestep,
                 encoder_hidden_states=pytorch_prompt_embeds,
                 attention_kwargs=attention_kwargs,
@@ -282,7 +342,7 @@ def wan_pipeline_call_with_mad_validation(
             # QAIC inference
             with current_model.cache_context("cond"):
                 start_transformer_step_time = time.time()
-                outputs = pipeline.transformer.qpc_session.run(inputs_aic)
+                outputs = current_qpc_session.run(inputs_aic)
                 end_transformer_step_time = time.time()
                 transformer_perf.append(end_transformer_step_time - start_transformer_step_time)
 
@@ -293,45 +353,77 @@ def wan_pipeline_call_with_mad_validation(
                 hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
                 noise_pred = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
-            # Transformer MAD validation
-            print(f" Performing MAD validation for {model_name} at step {i}...")
-            mad_validator.validate_module_mad(
-                noise_pred_torch.detach().cpu().numpy(),
-                noise_pred.detach().cpu().numpy(),
-                model_name,
-                f"step {i} (t={t.item():.1f})",
-            )
-
             # Update latents using scheduler
             latents = pipeline.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            latents_torch = reference_scheduler.step(noise_pred_torch, t, latents_torch, return_dict=False)[0]
 
             # Update progress bar
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipeline.scheduler.order == 0):
                 progress_bar.update()
 
-    # Step 9: Decode latents to video (using CPU VAE for now)
-    if not output_type == "latent":
-        latents = latents.to(pipeline.vae_decode.dtype)
-        latents_mean = (
-            torch.tensor(pipeline.vae_decode.config.latents_mean)
-            .view(1, pipeline.vae_decode.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(pipeline.vae_decode.config.latents_std).view(
-            1, pipeline.vae_decode.config.z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
-        latents = latents / latents_std + latents_mean
+    print(" Performing MAD validation for transformer final latent output...")
+    mad_validator.validate_module_mad(
+        latents_torch.detach().cpu().numpy(),
+        latents.detach().cpu().numpy(),
+        "transformer",
+        f"final latents after {num_inference_steps} steps",
+    )
 
-        video = pipeline.model.vae.decode(latents, return_dict=False)[0]
-
-        video = pipeline.model.video_processor.postprocess_video(video.detach())
+    if pipeline.use_unified:
+        release_qpc_session(pipeline.transformer)
     else:
-        video = latents
+        release_qpc_session(pipeline.transformer_high)
+        release_qpc_session(pipeline.transformer_low)
+    # Step 9: Decode latents to video QAIC VAE decoder
+    latents = latents.to(pipeline.vae_decoder.model.dtype)
+    latents_mean = (
+        torch.tensor(pipeline.vae_decoder.model.config.latents_mean)
+        .view(1, pipeline.vae_decoder.model.config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std = 1.0 / torch.tensor(pipeline.vae_decoder.model.latents_std).view(
+        1, pipeline.vae_decoder.model.config.z_dim, 1, 1, 1
+    ).to(latents.device, latents.dtype)
+    latents = latents / latents_std + latents_mean
+
+    # Initialize VAE decoder inference session
+    if pipeline.vae_decoder.qpc_session is None:
+        pipeline.vae_decoder.qpc_session = QAICInferenceSession(
+            str(pipeline.vae_decoder.qpc_path), device_ids=pipeline.vae_decoder.device_ids
+        )
+    # MAD Validation for VAE decoder - PyTorch reference inference
+    video_torch = pytorch_pipeline.vae.decode(latents, return_dict=False)[0]
+
+    # Allocate output buffer for VAE decoder
+    output_buffer = {"sample": np.zeros((batch_size, 3, num_frames, height, width), dtype=np.int32)}
+    pipeline.vae_decoder.qpc_session.set_buffers(output_buffer)
+
+    # Run VAE decoder inference and measure time
+    inputs = {"latent_sample": latents.numpy()}
+    start_decode_time = time.perf_counter()
+    video = pipeline.vae_decoder.qpc_session.run(inputs)
+    end_decode_time = time.perf_counter()
+    vae_decoder_perf = end_decode_time - start_decode_time
+    release_qpc_session(pipeline.vae_decoder)
+
+    # VAE decoder MAD validation
+    print(" Performing MAD validation for VAE decoder...")
+    mad_validator.validate_module_mad(
+        video_torch.detach().cpu().numpy(), video["sample"], "vae_decoder", "video decoding"
+    )
+
+    # Post-process video for output
+    video_tensor = torch.from_numpy(video["sample"])
+    video = pipeline.model.video_processor.postprocess_video(video_tensor)
 
     # Build performance metrics
-    perf_metrics = [
-        ModulePerf(module_name="transformer", perf=transformer_perf),
-    ]
+    perf_data = {
+        "transformer": transformer_perf,
+        "vae_decoder": vae_decoder_perf,
+    }
+
+    # Convert metrics to pipeline output format.
+    perf_metrics = [ModulePerf(module_name=name, perf=perf_data[name]) for name in perf_data.keys()]
 
     return QEffPipelineOutput(
         pipeline_module=perf_metrics,
@@ -339,94 +431,143 @@ def wan_pipeline_call_with_mad_validation(
     )
 
 
-@pytest.fixture(scope="session")
-def wan_pipeline():
-    """Setup compiled WAN pipeline for testing with LoRA adapters and 2 layers total"""
+def _build_wan_pipeline(use_unified: bool = True, enable_first_block_cache: bool = False):
+    """Build the WAN pipeline with random weights/ dummy config."""
+    torch.manual_seed(TEST_SEED)
+    np.random.seed(TEST_SEED)
+
     config = INITIAL_TEST_CONFIG["model_setup"]
+    model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    pipe_cfg = WanPipeline.load_config(model_id)
 
-    def load_wan_lora(path: str):
-        return _convert_non_diffusers_wan_lora_to_diffusers(safetensors.torch.load_file(path))
-
-    # Download and load LoRA adapters
-    high_noise_lora_path = hf_hub_download(
-        repo_id="lightx2v/Wan2.2-Lightning",
-        filename="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors",
+    vae_config = AutoencoderKLWan.load_config(model_id, subfolder="vae")
+    t_config = WanTransformer3DModel.load_config(model_id, subfolder="transformer")
+    tiny_vae_config = dict(vae_config)
+    # Reduced configs
+    tiny_vae_config.update(
+        {
+            "num_res_blocks": 1,
+            "base_dim": 16,
+            "dim_mult": [1, 1, 2, 2],
+            "z_dim": 16,
+            "temperal_downsample": [False, True, True],
+        }
     )
-    low_noise_lora_path = hf_hub_download(
-        repo_id="lightx2v/Wan2.2-Lightning",
-        filename="Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors",
+    vae = AutoencoderKLWan.from_config(tiny_vae_config)
+    # vae = AutoencoderKLWan.from_config(vae_config)  # Uncomment to use full VAE config.
+
+    # Keep transformer shallow for quicker tests.
+    t_config["num_layers"] = config["num_transformer_layers_high"]
+    transformer_high = WanTransformer3DModel.from_config(t_config)
+    transformer_low = WanTransformer3DModel.from_config(t_config)
+
+    # Random-init text encoder and scheduler from config to avoid model weight downloads.
+    text_encoder_cfg = UMT5EncoderModel.config_class.from_pretrained(model_id, subfolder="text_encoder")
+    text_encoder = UMT5EncoderModel(text_encoder_cfg)
+    tokenizer = T5TokenizerFast.from_pretrained(model_id, subfolder="tokenizer")
+    scheduler_cfg = FlowMatchEulerDiscreteScheduler.load_config(model_id, subfolder="scheduler")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_cfg)
+
+    pytorch_pipeline = WanPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=scheduler,
+        transformer=transformer_high,
+        transformer_2=transformer_low,
+        boundary_ratio=pipe_cfg.get("boundary_ratio"),
+        expand_timesteps=pipe_cfg.get("expand_timesteps", False),
     )
+    vae.eval()
+    transformer_high.eval()
+    transformer_low.eval()
+    text_encoder.eval()
 
-    # Load PyTorch reference pipeline
-    pytorch_pipeline = WanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
-
-    # Load into the transformers
-    pytorch_pipeline.transformer.load_lora_adapter(load_wan_lora(high_noise_lora_path), adapter_name="high_noise")
-    pytorch_pipeline.transformer.set_adapters(["high_noise"], weights=[1.0])
-
-    pytorch_pipeline.transformer_2.load_lora_adapter(load_wan_lora(low_noise_lora_path), adapter_name="low_noise")
-    pytorch_pipeline.transformer_2.set_adapters(["low_noise"], weights=[1.0])
-
-    # ### for 2 layer model
-    pytorch_pipeline.transformer.config.num_layers = config["num_transformer_layers_high"]
-    pytorch_pipeline.transformer_2.config.num_layers = config["num_transformer_layers_low"]
-    original_blocks = pytorch_pipeline.transformer.blocks
-    org_blocks = pytorch_pipeline.transformer_2.blocks
-    pytorch_pipeline.transformer.blocks = torch.nn.ModuleList(
-        [original_blocks[i] for i in range(0, pytorch_pipeline.transformer.config.num_layers)]
-    )
-    pytorch_pipeline.transformer_2.blocks = torch.nn.ModuleList(
-        [org_blocks[i] for i in range(0, pytorch_pipeline.transformer_2.config.num_layers)]
-    )
-
-    # Load QEff WAN pipeline
-    pipeline = QEffWanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
-
-    # Load LoRA adapters into transformers
-    pipeline.transformer.model.transformer_high.load_lora_adapter(
-        load_wan_lora(high_noise_lora_path), adapter_name="high_noise"
-    )
-    pipeline.transformer.model.transformer_high.set_adapters(["high_noise"], weights=[1.0])
-    pipeline.transformer.model.transformer_low.load_lora_adapter(
-        load_wan_lora(low_noise_lora_path), adapter_name="low_noise"
-    )
-    pipeline.transformer.model.transformer_low.set_adapters(["low_noise"], weights=[1.0])
-
-    # Reduce to 1 layer (1 high, 1 low) for testing
-    pipeline.transformer.model.transformer_high.config.num_layers = config["num_transformer_layers_high"]
-    pipeline.transformer.model.transformer_low.config.num_layers = config["num_transformer_layers_low"]
-
-    original_blocks_high = pipeline.transformer.model.transformer_high.blocks
-    original_blocks_low = pipeline.transformer.model.transformer_low.blocks
-
-    pipeline.transformer.model.transformer_high.blocks = torch.nn.ModuleList(
-        [original_blocks_high[i] for i in range(0, config["num_transformer_layers_high"])]
-    )
-    pipeline.transformer.model.transformer_low.blocks = torch.nn.ModuleList(
-        [original_blocks_low[i] for i in range(0, config["num_transformer_layers_low"])]
+    pytorch_pipeline_copy = copy.deepcopy(pytorch_pipeline)
+    pipeline = QEffWanPipeline(
+        pytorch_pipeline_copy,
+        use_unified=use_unified,
+        enable_first_block_cache=enable_first_block_cache,
     )
 
     return pipeline, pytorch_pipeline
+
+
+@pytest.fixture(scope="session")
+def wan_pipeline():
+    return _build_wan_pipeline(use_unified=True)
+
+
+@pytest.fixture(scope="session")
+def wan_pipeline_non_unified():
+    return _build_wan_pipeline(use_unified=False)
+
+
+@pytest.fixture(scope="session")
+def wan_pipeline_non_unified_first_block_cache():
+    return _build_wan_pipeline(use_unified=False, enable_first_block_cache=True)
 
 
 @pytest.mark.diffusion_models
 @pytest.mark.on_qaic
 @pytest.mark.wan
 def test_wan_pipeline(wan_pipeline):
+    _run_wan_pipeline_test_case(
+        wan_pipeline,
+        INITIAL_TEST_CONFIG,
+        CONFIG_PATH,
+        "WAN PIPELINE TEST",
+    )
+
+
+@pytest.mark.diffusion_models
+@pytest.mark.on_qaic
+@pytest.mark.wan
+def test_wan_pipeline_non_unified(wan_pipeline_non_unified):
+    _run_wan_pipeline_test_case(
+        wan_pipeline_non_unified,
+        NON_UNIFIED_TEST_CONFIG,
+        NON_UNIFIED_CONFIG_PATH,
+        "WAN PIPELINE NON-UNIFIED TEST",
+    )
+
+
+@pytest.mark.diffusion_models
+@pytest.mark.on_qaic
+@pytest.mark.wan
+def test_wan_pipeline_non_unified_first_block_cache(wan_pipeline_non_unified_first_block_cache):
+    _run_wan_pipeline_test_case(
+        wan_pipeline_non_unified_first_block_cache,
+        NON_UNIFIED_TEST_CONFIG,
+        NON_UNIFIED_CONFIG_PATH,
+        "WAN PIPELINE NON-UNIFIED FIRST-BLOCK-CACHE TEST",
+        pipeline_call_overrides={
+            "cache_threshold_high": 0.0,
+            "cache_threshold_low": 0.0,
+        },
+    )
+
+
+def _run_wan_pipeline_test_case(
+    wan_pipeline_data,
+    config,
+    compile_config_path: str,
+    test_label: str,
+    pipeline_call_overrides: Optional[Dict[str, Any]] = None,
+):
     """
-    Comprehensive WAN pipeline test that focuses on transformer validation:
-    - 192x320 resolution - 2 transformer layers total (1 high + 1 low)
+    Comprehensive WAN pipeline test case runner that focuses on transformer validation:
+    - 45p - 48x64 resolution - 2 transformer layers total (1 high + 1 low)
     - MAD validation for transformer modules only
     - Functional video generation test
-    - Export/compilation checks for transformer
+    - Export/compilation checks for transformer and VAE decoder
     - Returns QEffPipelineOutput with performance metrics
     """
-    pipeline, pytorch_pipeline = wan_pipeline
-    config = INITIAL_TEST_CONFIG
+    pipeline, pytorch_pipeline = wan_pipeline_data
 
     # Print test header
     DiffusersTestUtils.print_test_header(
-        f"WAN PIPELINE TEST - {config['model_setup']['height']}x{config['model_setup']['width']} Resolution, {config['model_setup']['num_frames']} Frames, 2 Layers Total",
+        f"{test_label} - {config['model_setup']['height']}x{config['model_setup']['width']} Resolution, {config['model_setup']['num_frames']} Frames, 2 Layers Total",
         config,
     )
 
@@ -439,11 +580,12 @@ def test_wan_pipeline(wan_pipeline):
     num_frames = config["model_setup"]["num_frames"]
 
     # Generate with MAD validation
-    generator = torch.manual_seed(42)
+    generator = torch.Generator(device="cpu").manual_seed(TEST_SEED)
     start_time = time.time()
 
     try:
-        # Run the pipeline with integrated MAD validation (focuses on transformer)
+        pipeline_call_overrides = pipeline_call_overrides or {}
+        # Run the pipeline with integrated MAD validation
         result = wan_pipeline_call_with_mad_validation(
             pipeline,
             pytorch_pipeline,
@@ -455,11 +597,13 @@ def test_wan_pipeline(wan_pipeline):
             guidance_scale_2=guidance_scale_2,
             num_inference_steps=num_inference_steps,
             max_sequence_length=max_sequence_length,
-            custom_config_path=CONFIG_PATH,
+            custom_config_path=compile_config_path,
             generator=generator,
             mad_tolerances=config["mad_validation"]["tolerances"],
+            use_onnx_subfunctions=config["pipeline_params"]["use_onnx_subfunctions"],
             parallel_compile=True,
             return_dict=True,
+            **pipeline_call_overrides,
         )
 
         execution_time = time.time() - start_time
@@ -506,16 +650,20 @@ def test_wan_pipeline(wan_pipeline):
             print(result)
 
         if config["validation_checks"]["onnx_export"]:
-            # Check if transformer ONNX file exists
             print("\n ONNX Export Validation:")
-            if hasattr(pipeline.transformer, "onnx_path") and pipeline.transformer.onnx_path:
+            if pipeline.use_unified:
                 DiffusersTestUtils.check_file_exists(str(pipeline.transformer.onnx_path), "transformer ONNX")
+            else:
+                DiffusersTestUtils.check_file_exists(str(pipeline.transformer_high.onnx_path), "transformer_high ONNX")
+                DiffusersTestUtils.check_file_exists(str(pipeline.transformer_low.onnx_path), "transformer_low ONNX")
 
         if config["validation_checks"]["compilation"]:
-            # Check if transformer QPC file exists
             print("\n Compilation Validation:")
-            if hasattr(pipeline.transformer, "qpc_path") and pipeline.transformer.qpc_path:
+            if pipeline.use_unified:
                 DiffusersTestUtils.check_file_exists(str(pipeline.transformer.qpc_path), "transformer QPC")
+            else:
+                DiffusersTestUtils.check_file_exists(str(pipeline.transformer_high.qpc_path), "transformer_high QPC")
+                DiffusersTestUtils.check_file_exists(str(pipeline.transformer_low.qpc_path), "transformer_low QPC")
 
         # Print test summary
         print(f"\nTotal execution time: {execution_time:.4f}s")
@@ -524,6 +672,8 @@ def test_wan_pipeline(wan_pipeline):
     except Exception as e:
         print(f"\nTEST FAILED: {e}")
         raise
+    finally:
+        release_pipeline_qpc_sessions(pipeline, ["transformer", "transformer_high", "transformer_low", "vae_decoder"])
 
 
 if __name__ == "__main__":

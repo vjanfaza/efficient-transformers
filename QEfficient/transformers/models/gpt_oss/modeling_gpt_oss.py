@@ -30,6 +30,17 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from QEfficient.blocking.attention_blocking import (
+    AttentionBlockingConfig,
+    BlockingMode,
+    generic_blocked_attention_interface,
+    past_key_value_update,
+)
+from QEfficient.customop.ctx_scatter_gather import (
+    CtxGatherFunc3DGeneralized,
+    CtxScatterFunc3DGeneralized,
+    CtxScatterFunc3DInt,
+)
 from QEfficient.transformers.cache_utils import QEffHybridCacheForGPTOSS
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
@@ -38,63 +49,159 @@ from QEfficient.utils.logging_utils import logger
 
 class QEffGptOssExperts(GptOssExperts):
     def __qeff_init__(self):
-        self.gate_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, self.expert_dim))
-        self.up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, self.expert_dim))
-        self.gate_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.expert_dim))
-        self.up_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.expert_dim))
+        # transformers>=5 uses fused gate_up projections. Keep backward-compatible
+        # aliases expected by existing QEff paths.
+        self.expert_dim = getattr(self, "intermediate_size", self.gate_up_proj.shape[-1] // 2)
+        self.gate_proj = nn.Parameter(self.gate_up_proj[:, :, : self.expert_dim].detach().clone())
+        self.up_proj = nn.Parameter(self.gate_up_proj[:, :, self.expert_dim :].detach().clone())
+        self.gate_proj_bias = nn.Parameter(self.gate_up_proj_bias[:, : self.expert_dim].detach().clone())
+        self.up_proj_bias = nn.Parameter(self.gate_up_proj_bias[:, self.expert_dim :].detach().clone())
+
+
+def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
+    """Build packed->original token index"""
+    batch_size, seq_len = T2Ei.shape
+    int32_max = torch.iinfo(torch.int32).max
+    int32_max_scalar = torch.tensor(int32_max, dtype=torch.int32, device=T2Ei.device)
+    token_idx = torch.arange(seq_len, dtype=torch.int32, device=T2Ei.device).unsqueeze(0).expand(batch_size, -1)
+    valid_prefix = torch.cumsum(T2Ei.to(torch.int32), dim=1)
+    valid_dest = valid_prefix - 1
+    scatter_pos = torch.where(T2Ei, valid_dest, int32_max_scalar)
+    matched_idx = torch.full_like(token_idx, int32_max)
+    matched_idx = CtxScatterFunc3DInt.apply(
+        matched_idx.unsqueeze(-1),
+        scatter_pos,
+        token_idx.unsqueeze(-1),
+    ).squeeze(-1)
+    return matched_idx
+
+
+def _cumsum_scatter_gather_update_gptoss_expert_blocked(
+    x: torch.Tensor,
+    T2Ei: torch.Tensor,
+    W_g: torch.Tensor,
+    W_u: torch.Tensor,
+    W_d: torch.Tensor,
+    b_g: torch.Tensor,
+    b_u: torch.Tensor,
+    b_d: torch.Tensor,
+    routing_weight: torch.Tensor,
+    expert_out: torch.Tensor,
+    limit: float,
+    alpha: float,
+    packed_chunk_size: int,
+) -> torch.Tensor:
+    """Cumsum-scatter-gather-update expert helper for GPT-OSS NSP-blocked dispatch.
+
+    Same algorithm as the Qwen3-MOE version but with GPT-OSS biases and GLU
+    activation (clamped gate/up, ``(up + 1) * gate * sigmoid(gate * alpha)``).
+
+    Shapes:
+        x               : [T, H]
+        T2Ei            : [num_nsp, T]            (bool)
+        W_g, W_u        : [num_nsp, H, I]
+        W_d             : [num_nsp, I, H]
+        b_g, b_u        : [num_nsp, I]
+        b_d             : [num_nsp, H]
+        routing_weight  : [num_nsp, T, 1]
+        expert_out      : [num_nsp, T, H]         (accumulator, in-out)
+    """
+    batch_size, seq_len = T2Ei.shape
+    packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
+
+    matched_idx = _build_matched_idx_from_cumsum(T2Ei)
+    valid_rows = torch.einsum("ij->i", T2Ei.to(torch.int32)).unsqueeze(1)
+    row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
+    x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
+
+    for packed_start in range(0, seq_len, packed_chunk_size):
+        packed_stop = packed_start + packed_chunk_size
+        chunk_matched_idx = matched_idx[:, packed_start:packed_stop]
+
+        x_chunk = CtxGatherFunc3DGeneralized.apply(x_expanded, chunk_matched_idx)
+
+        gate = (x_chunk @ W_g) + b_g.unsqueeze(1)
+        up = (x_chunk @ W_u) + b_u.unsqueeze(1)
+        gate = gate.clamp(min=torch.finfo(torch.float16).min, max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        glu = gate * torch.sigmoid(gate * alpha)
+        intermediate = (up + 1) * glu
+        down_chunk = (intermediate @ W_d) + b_d.unsqueeze(1)
+
+        rw_chunk = CtxGatherFunc3DGeneralized.apply(routing_weight, chunk_matched_idx)
+        down_chunk = down_chunk * rw_chunk
+
+        expert_out_chunk = CtxGatherFunc3DGeneralized.apply(expert_out, chunk_matched_idx)
+        updated_chunk = expert_out_chunk + down_chunk
+
+        chunk_valid_rows = torch.clamp(
+            valid_rows - packed_start,
+            min=torch.zeros_like(valid_rows),
+            max=torch.full_like(valid_rows, packed_chunk_size),
+        )
+        updated_chunk = torch.where(
+            (row_range < chunk_valid_rows).unsqueeze(-1), updated_chunk, torch.zeros_like(updated_chunk)
+        )
+        expert_out = CtxScatterFunc3DGeneralized.apply(expert_out, chunk_matched_idx, updated_chunk)
+
+    return expert_out
 
 
 class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
+    supports_moe_prefill_blocking = True
+
     def forward(self, hidden: torch.Tensor):
         B, S, H = hidden.shape
         T = B * S
         hidden = hidden.view(T, H)
 
-        # Router computation
         router_logits = F.linear(hidden, self.router.weight, self.router.bias)
-
-        # Top-k selection
-        top_w, top_i = torch.topk(router_logits, self.router.top_k, dim=-1)  # both [T, K]
+        top_w, top_i = torch.topk(router_logits, self.router.top_k, dim=-1)
         top_w = torch.nn.functional.softmax(top_w, dim=1, dtype=top_w.dtype)
 
-        masked_logits = torch.zeros_like(router_logits)
-        masked_logits.scatter_(1, top_i, top_w)
+        routing_weights = torch.zeros_like(router_logits)
+        routing_weights.scatter_(1, top_i, top_w)
 
-        # Routing weights for each expert [T, E]
-        routing_weights = masked_logits
+        num_experts = self.experts.num_experts
+        num_nsp = getattr(self, "expert_blocking_num_nsp", num_experts)
+        packed_chunk_size = getattr(self, "expert_blocking_packed_chunk_size", T)
+        if num_experts % num_nsp != 0:
+            raise ValueError(f"num_experts ({num_experts}) must be divisible by expert_blocking_num_nsp ({num_nsp})")
 
-        # ────────────────── allocate the output tensor ─────
-        expert_out = hidden.new_zeros((T, H))  # accumulation buffer
+        local_experts = num_experts // num_nsp
+        expert_dim = self.experts.expert_dim
+        routing_weights_by_expert = (
+            routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
+        )
+        W_g = self.experts.gate_proj.view(local_experts, num_nsp, H, expert_dim).transpose(0, 1).contiguous()
+        W_u = self.experts.up_proj.view(local_experts, num_nsp, H, expert_dim).transpose(0, 1).contiguous()
+        W_d = self.experts.down_proj.view(local_experts, num_nsp, expert_dim, H).transpose(0, 1).contiguous()
+        b_g = self.experts.gate_proj_bias.view(local_experts, num_nsp, expert_dim).transpose(0, 1).contiguous()
+        b_u = self.experts.up_proj_bias.view(local_experts, num_nsp, expert_dim).transpose(0, 1).contiguous()
+        b_d = self.experts.down_proj_bias.view(local_experts, num_nsp, H).transpose(0, 1).contiguous()
 
-        # ───────────────────────── Expert computation loop ─────────────────────────────
-        for e in range(self.experts.num_experts):
-            routing_weight = routing_weights[:, e].unsqueeze(-1)  # [T, 1]
+        expert_out = hidden.new_zeros((num_nsp, T, H))
+        routing_weights_unsqueezed = routing_weights_by_expert.unsqueeze(-1)
+        for local_slot in range(local_experts):
+            T2Ei = routing_weights_by_expert[:, local_slot, :] > 0
+            expert_out = _cumsum_scatter_gather_update_gptoss_expert_blocked(
+                x=hidden,
+                T2Ei=T2Ei,
+                W_g=W_g[:, local_slot],
+                W_u=W_u[:, local_slot],
+                W_d=W_d[:, local_slot],
+                b_g=b_g[:, local_slot],
+                b_u=b_u[:, local_slot],
+                b_d=b_d[:, local_slot],
+                routing_weight=routing_weights_unsqueezed[:, local_slot],
+                expert_out=expert_out,
+                limit=self.experts.limit,
+                alpha=self.experts.alpha,
+                packed_chunk_size=packed_chunk_size,
+            )
 
-            W_g, W_u = self.experts.gate_proj[e], self.experts.up_proj[e]  # [H, I], [H, I]
-            b_g, b_u = self.experts.gate_proj_bias[e], self.experts.up_proj_bias[e]  # [I], [I]
-            W_d = self.experts.down_proj[e]  # [I, H]
-            b_d = self.experts.down_proj_bias[e]  # [H]
-
-            # Gate and Up projections
-            gate = (hidden @ W_g) + b_g  # [T, I]
-            up = (hidden @ W_u) + b_u  # [T, I]
-
-            # Apply GptOss activation with clamping
-            gate = gate.clamp(min=torch.finfo(torch.float16).min, max=self.experts.limit)
-            up = up.clamp(min=-self.experts.limit, max=self.experts.limit)
-
-            # GLU activation
-            glu = gate * torch.sigmoid(gate * self.experts.alpha)
-            intermediate = (up + 1) * glu  # [T, I]
-
-            # Down projection
-            down_out = (intermediate @ W_d) + b_d  # [T, H]
-
-            # Apply routing weights and accumulate
-            expert_out += down_out * routing_weight
-
-        # original shape [B, S, H]
-        return expert_out.view(B, S, H), router_logits
+        expert_out_sum = torch.einsum("nth->th", expert_out)
+        return expert_out_sum.view(B, S, H), router_logits
 
 
 class QEffPrefillOnlyGptOssMLP(GptOssMLP):
@@ -354,7 +461,7 @@ class QEffGptOssMLP(GptOssMLP):
 
         # Apply routing weights AFTER expert computation (This is before on Llama4)
         experts_out = experts_out * router_top_value.unsqueeze(-1)
-        experts_out = experts_out.sum(dim=1)
+        experts_out = torch.einsum("bnd->bd", experts_out)
 
         return experts_out, router_logits
 
@@ -514,7 +621,7 @@ class QEffGptOssRotaryEmbedding(GptOssRotaryEmbedding):
         super().__init__(config=config)
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
-            seq_len=self.original_max_seq_len, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+            seq_len=self.original_max_seq_len, device=self.inv_freq.device, dtype=config.torch_dtype
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
@@ -535,7 +642,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+def qeff_apply_rotary_pos_emb(q, k, cos, sin):
     """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
 
     Explanation:
@@ -552,24 +659,9 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        mrope_section(`List(int)`):
-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -593,7 +685,7 @@ def eager_attention_forward(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = torch.where(
-            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
+            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=module.config.torch_dtype), attn_weights
         )
 
     sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
@@ -608,57 +700,6 @@ def eager_attention_forward(
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
-
-
-def eager_attention_forward_blocked(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    BS, NH, CL, DH = query.shape
-    target_blocks = int(os.environ.get("NUM_Q_BLOCKS", 1))
-    block_positions = []
-    for j in range(target_blocks):
-        block_positions.append(j * (CL // target_blocks))
-    block_count = 0
-
-    outs = []
-    for block_idx in range(target_blocks):
-        block_count += 1
-        qi = block_positions[block_idx]
-
-        # Calculate block size (last block should be handled with remainder)
-        if block_idx == target_blocks - 1:
-            real_q_len = CL - qi
-        else:
-            real_q_len = block_positions[block_idx + 1] - qi
-
-        q_block = query[:, :, qi : qi + real_q_len, :]
-        scores = torch.matmul(q_block, key_states.transpose(2, 3)) * scaling
-        attn_mask_block = attention_mask[:, :, qi : qi + real_q_len, :]
-        curr_attn_weights = torch.where(
-            attn_mask_block, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), scores
-        )
-        sinks = module.sinks.reshape(1, -1, 1, 1).expand(
-            curr_attn_weights.shape[0], -1, curr_attn_weights.shape[-2], -1
-        )
-        combined_logits = torch.cat([curr_attn_weights, sinks], dim=-1)
-        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-        curr_attn_weights = nn.functional.softmax(combined_logits, dim=-1, dtype=torch.float32)
-        curr_attn_weights = curr_attn_weights[..., :-1]
-        out_block = torch.matmul(curr_attn_weights, value_states)
-        outs.append(out_block)
-    output = torch.cat(outs, dim=2)
-
-    output = output.view(BS, NH, CL, DH).transpose(1, 2).contiguous()
-    return output, output
 
 
 def opt_eager_attention_forward_blocked(
@@ -707,7 +748,7 @@ def opt_eager_attention_forward_blocked(
 
         scores = torch.matmul(q_block, k_block.transpose(2, 3)) * scaling
         curr_attn_weights = torch.where(
-            attn_mask_block, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), scores
+            attn_mask_block, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=module.config.torch_dtype), scores
         )
         sinks = module.sinks.reshape(1, -1, 1, 1).expand(
             curr_attn_weights.shape[0], -1, curr_attn_weights.shape[-2], -1
@@ -733,7 +774,7 @@ class QEffPrefillOnlyChunkedGptOssAttention(GptOssAttention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -748,11 +789,9 @@ class QEffPrefillOnlyChunkedGptOssAttention(GptOssAttention):
         hidden_shape = (*input_shape, -1, self.head_dim)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        query_states, key_states = qeff_apply_rotary_pos_emb(
-            query_states, key_states, cos_cached, sin_cached, position_ids
-        )
+        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos_cached, sin_cached)
 
-        if past_key_value is not None:
+        if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {
                 "sin": sin_cached,
@@ -764,14 +803,14 @@ class QEffPrefillOnlyChunkedGptOssAttention(GptOssAttention):
                 "sliding_window": self.sliding_window,
             }
             if self.sliding_window is not None:
-                key_states, value_states = past_key_value.sliding_window_update_chunked(
+                key_states, value_states = past_key_values.sliding_window_update_chunked(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
             else:
                 if comp_ctx_lengths is not None:
                     attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
                     cache_kwargs["CCL"] = attention_mask.shape[-1]
-                key_states, value_states = past_key_value.full_cache_update_chunked(
+                key_states, value_states = past_key_values.full_cache_update_chunked(
                     key_states, value_states, self.layer_idx, cache_kwargs
                 )
 
@@ -805,7 +844,7 @@ class QEffPrefillOnlyChunkedGptOssAttention(GptOssAttention):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values
 
 
 class QEffPrefillOnlyGptOssAttention(GptOssAttention):
@@ -817,7 +856,7 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -832,11 +871,9 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
         hidden_shape = (*input_shape, -1, self.head_dim)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        query_states, key_states = qeff_apply_rotary_pos_emb(
-            query_states, key_states, cos_cached, sin_cached, position_ids
-        )
+        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos_cached, sin_cached)
 
-        if past_key_value is not None:
+        if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {
                 "sin": sin_cached,
@@ -845,11 +882,11 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
                 "position_ids": position_ids,
                 "config": self.config,
                 "is_sliding": self.sliding_window is not None,
-                "sliding_window": past_key_value.sliding_window_len,
+                "sliding_window": past_key_values.sliding_window_len,
             }
             if self.sliding_window is not None:
-                sliding_window_len = past_key_value.sliding_window_len
-                short_read_idx = torch.arange(past_key_value.key_cache[self.layer_idx].shape[2])
+                sliding_window_len = past_key_values.sliding_window_len
+                short_read_idx = torch.arange(past_key_values.key_cache[self.layer_idx].shape[2])
                 read_idx = short_read_idx + torch.where(
                     position_ids.max() > sliding_window_len - 1, position_ids.max() - sliding_window_len + 1, 0
                 )
@@ -859,7 +896,7 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
                 v_cache = value_states[:, :, read_idx, :]
             else:
                 k_cache, v_cache = key_states, value_states
-            _, _ = past_key_value.write_only(k_cache, v_cache, self.layer_idx, cache_kwargs)
+            _, _ = past_key_values.write_only(k_cache, v_cache, self.layer_idx, cache_kwargs)
 
         if self.sliding_window is not None:
             attention_mask = sliding_mask
@@ -869,7 +906,7 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
         if os.environ.get("ENABLE_OPT_SWA", "0") == "1":
             attention_interface: Callable = opt_eager_attention_forward_blocked
         else:
-            attention_interface: Callable = eager_attention_forward_blocked
+            attention_interface: Callable = eager_attention_forward
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -885,7 +922,7 @@ class QEffPrefillOnlyGptOssAttention(GptOssAttention):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values
 
 
 class QEffGptOssAttention(GptOssAttention):
@@ -897,7 +934,7 @@ class QEffGptOssAttention(GptOssAttention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -912,48 +949,64 @@ class QEffGptOssAttention(GptOssAttention):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        query_states, key_states = qeff_apply_rotary_pos_emb(
-            query_states, key_states, cos_cached, sin_cached, position_ids
-        )
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin_cached,
-                "cos": cos_cached,
-                "batch_index": batch_index,
-                "position_ids": position_ids,
-                "config": self.config,
-                "is_sliding": self.sliding_window is not None,
-                "sliding_window": past_key_value.sliding_window_len,
-            }
-            if comp_ctx_lengths is not None:
-                attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
-                cache_kwargs["CCL"] = attention_mask.shape[-1]
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        past_seen_tokens = past_key_values.get_seq_length(self.layer_idx) if past_key_values is not None else 0
+        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos_cached, sin_cached)
 
         if self.sliding_window is not None:
             attention_mask = sliding_mask
-        else:
-            attention_mask = attention_mask
 
-        attention_interface: Callable = eager_attention_forward
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,  # diff with Llama
-            **kwargs,
+        blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
+        use_blocking = (
+            blocking_config is not None
+            and (blocking_config.mode != BlockingMode.NONE)
+            and (self.sliding_window is None)
         )
+        if use_blocking:
+            attn_output, attn_weights = generic_blocked_attention_interface(
+                module=self,
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
+                scaling=self.scaling,
+                layer_idx=self.layer_idx,
+                past_key_value=past_key_values,
+                blocking_config=blocking_config,
+                comp_ctx_length=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids,
+                past_seen_tokens=past_seen_tokens,
+                sliding_window=self.sliding_window,
+                sinks=self.sinks,
+            )
+        else:
+            key_states, value_states, attention_mask, _ = past_key_value_update(
+                module=self,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_values,
+                comp_ctx_lengths=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids,
+                sliding_window=self.sliding_window,
+            )
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values
 
 
 class QEffGptOssDecoderLayer(GptOssDecoderLayer):
@@ -981,7 +1034,7 @@ class QEffGptOssDecoderLayer(GptOssDecoderLayer):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_value,
             comp_ctx_lengths=comp_ctx_lengths,
             batch_index=batch_index,
             use_cache=use_cache,
@@ -1071,6 +1124,8 @@ class QEffPrefillOnlyGptOssModel(GptOssModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+        cos = self.cos_cached[position_ids].unsqueeze(1)
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -1086,8 +1141,8 @@ class QEffPrefillOnlyGptOssModel(GptOssModel):
                 output_attentions=output_attentions,
                 cache_position=cache_position,
                 sliding_mask=sliding_mask,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
+                sin_cached=sin,
+                cos_cached=cos,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1112,8 +1167,8 @@ class QEffPrefillOnlyGptOssModel(GptOssModel):
 class QEffGptOssModel(GptOssModel):
     def __qeff_init__(self):
         self.rotary_emb = QEffGptOssRotaryEmbedding(config=self.config)
-        self.sin_cached = torch.nn.Parameter(self.rotary_emb.sin_cached)
-        self.cos_cached = torch.nn.Parameter(self.rotary_emb.cos_cached)
+        self.sin_cached = torch.nn.Parameter(self.rotary_emb.sin_cached * self.rotary_emb.attention_scaling)
+        self.cos_cached = torch.nn.Parameter(self.rotary_emb.cos_cached * self.rotary_emb.attention_scaling)
 
     def forward(
         self,
@@ -1171,6 +1226,8 @@ class QEffGptOssModel(GptOssModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+        cos = self.cos_cached[position_ids].unsqueeze(1)
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -1187,8 +1244,8 @@ class QEffGptOssModel(GptOssModel):
                 output_attentions=output_attentions,
                 cache_position=cache_position,
                 sliding_mask=sliding_mask,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
+                sin_cached=sin,
+                cos_cached=cos,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]

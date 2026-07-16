@@ -5,43 +5,27 @@
 #
 # -----------------------------------------------------------------------------
 
+import json
 import os
 from time import perf_counter
 from typing import List, Optional
 
 import numpy as np
 import pytest
-from transformers import AutoTokenizer
+import torch
+from transformers import AutoConfig, AutoTokenizer
 
-from QEfficient import QEFFAutoModelForCausalLM as AutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.utils.constants import Constants
-from QEfficient.utils.device_utils import get_available_device_id
+from QEfficient.utils.test_utils import load_qeff_causal_lm_model
 
-configs = [
-    pytest.param(
-        Constants.INPUT_STR,  # prompts
-        4,  # num_speculative_tokens
-        32,  # prefill_seq_len
-        128,  # ctx_len
-        1,  # prefill_bsz
-        "JackFram/llama-160m",  # draft_model_name
-        "JackFram/llama-160m",  # target_model_name
-        1,  # full_batch_size
-        id="CB llama",
-    ),
-    pytest.param(
-        Constants.INPUT_STR,  # prompts
-        4,  # num_speculative_tokens
-        32,  # prefill_seq_len
-        128,  # ctx_len
-        1,  # prefill_bsz
-        "Qwen/Qwen2-0.5B",  # draft_model_name
-        "Qwen/Qwen2-0.5B",  # target_model_name
-        1,  # full_batch_size
-        id="CB qwen",
-    ),
-]
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../../configs/feature_configs.json")
+with open(CONFIG_PATH, "r") as f:
+    config_data = json.load(f)
+    spd_models = config_data["spd_config"]
+
+test_models_id = [model["id"] for model in spd_models]
+model_config_dict = {model["id"]: model for model in spd_models}
 
 
 def run_prefill_on_draft_and_target(
@@ -104,26 +88,18 @@ def split_dlm_bonus_token_inputs(dlm_decode_inputs):
     return bonus_token_inputs, dlm_decode_inputs
 
 
-@pytest.mark.on_qaic
-@pytest.mark.feature
-@pytest.mark.parametrize(
-    "prompts, num_speculative_tokens, prefill_seq_len, ctx_len, prefill_bsz, draft_model_name, target_model_name, full_batch_size",
-    configs,
-)
-def test_spec_decode_inference(
-    prompts: List[str],
-    num_speculative_tokens: int,
-    prefill_seq_len: int,
-    ctx_len: int,
-    prefill_bsz: int,
-    draft_model_name: str,
-    target_model_name: str,
-    full_batch_size: Optional[int],
+def check_spec_decode_inference(
+    model_id: str, manual_cleanup: callable, num_hidden_layers: Optional[int] = -1, config: Optional[AutoConfig] = None
 ):
-    # get device group
-    device_group: List[int] = get_available_device_id()
-    if not device_group:
-        pytest.skip("No available devices to run model on Cloud AI 100")
+    draft_model_name = model_config_dict[model_id]["draft_model_name"]
+    target_model_name = model_config_dict[model_id]["target_model_name"]
+    prompts = model_config_dict[model_id]["prompts"]
+    num_speculative_tokens = model_config_dict[model_id]["num_speculative_tokens"]
+    prefill_seq_len = model_config_dict[model_id]["prefill_seq_len"]
+    ctx_len = model_config_dict[model_id]["ctx_len"]
+    prefill_bsz = model_config_dict[model_id]["prefill_bsz"]
+    full_batch_size = model_config_dict[model_id]["full_batch_size"]
+
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
     # get vocab size
     tokenizer = AutoTokenizer.from_pretrained(target_model_name, padding_side="right")
@@ -136,10 +112,20 @@ def test_spec_decode_inference(
     # export_and_compile tlm and dlm
     continuous_batching = full_batch_size is not None
     qaic_config = dict(speculative_model_type="target")
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_model_name, continuous_batching=continuous_batching, qaic_config=qaic_config
+
+    target_model = load_qeff_causal_lm_model(
+        target_model_name,
+        continuous_batching=continuous_batching,
+        qaic_config=qaic_config,
+        num_hidden_layers=num_hidden_layers,
+        config=config,
     )
-    draft_model = AutoModelForCausalLM.from_pretrained(draft_model_name, continuous_batching=continuous_batching)
+    draft_model = load_qeff_causal_lm_model(
+        draft_model_name,
+        continuous_batching=continuous_batching,
+        num_hidden_layers=num_hidden_layers,
+        config=config,
+    )
 
     target_model_qpc_path: str = target_model.compile(
         num_cores=6,
@@ -350,3 +336,252 @@ def test_spec_decode_inference(
     assert all_matching, "Tokens don't match for SpD output and vanilla DLM output."
     assert os.path.isfile(os.path.join(os.path.dirname(target_model_qpc_path), "qconfig.json"))
     assert os.path.isfile(os.path.join(os.path.dirname(draft_model_qpc_path), "qconfig.json"))
+    manual_cleanup(target_model.onnx_path)
+    manual_cleanup(draft_model.onnx_path)
+
+
+@pytest.mark.full_layers
+@pytest.mark.on_qaic
+@pytest.mark.feature
+@pytest.mark.parametrize("model_id", test_models_id)
+def test_full_spd_inference(model_id, manual_cleanup):
+    """Test full layer SPD inference."""
+    torch.manual_seed(42)
+    check_spec_decode_inference(model_id, manual_cleanup=manual_cleanup)
+
+
+@pytest.mark.few_layers
+@pytest.mark.on_qaic
+@pytest.mark.feature
+@pytest.mark.parametrize("model_id", test_models_id)
+def test_few_spd_inference(model_id, manual_cleanup):
+    """Test few layer SPD inference."""
+    torch.manual_seed(42)
+    check_spec_decode_inference(model_id, num_hidden_layers=2, manual_cleanup=manual_cleanup)
+
+
+# llama error with SPD, skipping dummy layer test for now
+@pytest.mark.skip(reason="Dummy layer test is currently failing for SPD, needs investigation")
+@pytest.mark.dummy_layers
+@pytest.mark.on_qaic
+@pytest.mark.feature
+@pytest.mark.parametrize("model_id", test_models_id)
+def test_dummy_spd_inference(model_id, manual_cleanup):
+    """Test dummy layer SPD inference."""
+    torch.manual_seed(42)
+    hf_config = AutoConfig.from_pretrained(
+        model_config_dict[model_id]["draft_model_name"],
+        trust_remote_code=True,
+        **model_config_dict[model_id]["additional_params"],
+    )
+    check_spec_decode_inference(model_id, config=hf_config, manual_cleanup=manual_cleanup)
+
+
+# ---------------------------------------------------------------------------
+# Multi-spec logit correctness — hardware-level QPC test
+# ---------------------------------------------------------------------------
+
+_MULTI_SPEC_MODEL = "JackFram/llama-68m"
+_MULTI_SPEC_NUM_LAYERS = 2
+_MULTI_SPEC_PREFILL_LEN = 32
+_MULTI_SPEC_CTX_LEN = 128
+_MULTI_SPEC_N_STEPS = 8  # decode positions to verify per specialisation
+_MULTI_SPEC_PROMPT = "My name is"
+
+
+def _run_prefill(session, tokenized, vocab_size, num_logits_to_keep=None):
+    """Run chunked prefill and return the logit from the last chunk."""
+    inputs = dict(tokenized)
+    if num_logits_to_keep is not None:
+        inputs["num_logits_to_keep"] = num_logits_to_keep
+    ph = np.zeros((1, 1, vocab_size), dtype=np.float32)
+    session.set_buffers({"logits": ph})
+    out = session.run(inputs)
+    return out["logits"][0, 0, :]  # [vocab]
+
+
+def _collect_vanilla_reference(session, first_token, start_pos, vocab_size, n_steps):
+    """
+    Teacher-forced decode: feed ground-truth tokens one at a time and collect
+    (logit, next_token) at each position.
+
+    Returns:
+        ref_tokens : list[int]  – tokens[i] is fed at position start_pos+i
+        ref_logits : list[ndarray]  – ref_logits[i] is the logit produced after
+                                       feeding tokens[i], shape [vocab]
+    """
+    ref_tokens = [int(first_token)]
+    ref_logits = []
+    ph = np.zeros((1, 1, vocab_size), dtype=np.float32)
+    session.set_buffers({"logits": ph})
+    for step in range(n_steps):
+        out = session.run(
+            {
+                "input_ids": np.array([[ref_tokens[-1]]], dtype=np.int64),
+                "position_ids": np.array([[start_pos + step]], dtype=np.int64),
+            }
+        )
+        logit = out["logits"][0, 0, :].copy()
+        ref_logits.append(logit)
+        ref_tokens.append(int(logit.argmax()))
+    return ref_tokens, ref_logits
+
+
+def _verify_tlm_spec(tlm_session, k, ref_tokens, ref_logits, start_pos, vocab_size):
+    """
+    Run TLM with seq_len=k+1 (teacher-forced in chunks) and assert that every
+    output logit matches the corresponding vanilla reference logit.
+
+    Both the accepted-token (argmax) and the full logit vector (atol=5e-2) are
+    checked.  Chunks are non-overlapping; leftover positions at the end are skipped.
+
+    Returns the number of (position, specialisation) pairs that were asserted.
+    """
+    seq_len = k + 1
+    n_logits_to_keep = np.arange(seq_len, dtype=np.int64).reshape(-1, 1)
+    ph = np.zeros((1, seq_len, vocab_size), dtype=np.float32)
+    tlm_session.set_buffers({"logits": ph})
+
+    n_assertions = 0
+    n_chunks = len(ref_logits) // seq_len
+    for chunk in range(n_chunks):
+        chunk_tokens = ref_tokens[chunk * seq_len : chunk * seq_len + seq_len]
+        chunk_positions = np.array([[start_pos + chunk * seq_len + i for i in range(seq_len)]], dtype=np.int64)
+        out = tlm_session.run(
+            {
+                "input_ids": np.array([chunk_tokens], dtype=np.int64),
+                "position_ids": chunk_positions,
+                "num_logits_to_keep": n_logits_to_keep,
+            }
+        )
+        tlm_logits = out["logits"]  # [1, seq_len, vocab]
+
+        for i in range(seq_len):
+            ref_pos = chunk * seq_len + i
+            ref_logit = ref_logits[ref_pos]
+            tlm_logit = tlm_logits[0, i, :]
+
+            assert np.allclose(tlm_logit, ref_logit, atol=5e-2), (
+                f"K={k}, chunk={chunk}, offset={i} (abs pos {start_pos + ref_pos}): "
+                f"logit mismatch — max_diff={np.abs(tlm_logit - ref_logit).max():.3e}"
+            )
+            assert int(tlm_logit.argmax()) == int(ref_logit.argmax()), (
+                f"K={k}, chunk={chunk}, offset={i} (abs pos {start_pos + ref_pos}): "
+                f"accepted-token mismatch — "
+                f"TLM={int(tlm_logit.argmax())} vs ref={int(ref_logit.argmax())}"
+            )
+            n_assertions += 1
+
+    return n_assertions
+
+
+@pytest.mark.on_qaic
+@pytest.mark.feature
+@pytest.mark.parametrize(
+    "decode_ks",
+    [
+        [0],  # fallback-only (seq_len=1)
+        [3],  # full-K only  (seq_len=4)
+        [0, 3],  # fallback + full-K (typical PLD config)
+        [1, 2, 3],  # suffix-decoding range
+    ],
+)
+def test_multi_spec_qpc_logit_correctness(decode_ks, manual_cleanup):
+    """
+    Verify that every decode specialisation in `decode_ks` produces logits that
+    match the vanilla (DLM) reference at every token position, for ALL output
+    positions of each specialisation.
+
+    Strategy
+    --------
+    1. Compile vanilla model (seq_len=1 decode) → collect ref_logits[pos] at each
+       of _MULTI_SPEC_N_STEPS positions using teacher-forcing with greedy outputs.
+    2. Compile TLM with all K values in decode_ks.
+    3. For each K:  fresh TLM session (resets KV cache) → prefill same prompt →
+       teacher-forced decode in non-overlapping K+1 chunks → assert ALL K+1 output
+       logits per chunk match ref_logits at corresponding positions.
+
+    Scaling: adding K values to decode_ks automatically adds new assertions.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(_MULTI_SPEC_MODEL, padding_side="right")
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    vocab_size = len(tokenizer)
+
+    # Tokenise prompt (padded to prefill_seq_len)
+    raw = tokenizer(_MULTI_SPEC_PROMPT, return_tensors="np")
+    input_len = int(raw.input_ids.shape[1])
+    pad_len = _MULTI_SPEC_PREFILL_LEN
+    tokenized = tokenizer(
+        _MULTI_SPEC_PROMPT,
+        return_tensors="np",
+        padding="max_length",
+        max_length=pad_len,
+    )
+    position_ids = np.where(
+        tokenized.pop("attention_mask"),
+        np.arange(pad_len),
+        -1,
+    )
+    prefill_inputs = {
+        "input_ids": tokenized["input_ids"],
+        "position_ids": position_ids,
+    }
+
+    # ── 1. Compile vanilla (DLM) model ──────────────────────────────────────
+    vanilla = load_qeff_causal_lm_model(_MULTI_SPEC_MODEL, num_hidden_layers=_MULTI_SPEC_NUM_LAYERS)
+    vanilla_qpc = vanilla.compile(
+        num_cores=2,
+        prefill_seq_len=_MULTI_SPEC_PREFILL_LEN,
+        ctx_len=_MULTI_SPEC_CTX_LEN,
+        aic_enable_depth_first=True,
+    )
+
+    # ── 2. Compile TLM with all decode specialisations ───────────────────────
+    tlm = load_qeff_causal_lm_model(
+        _MULTI_SPEC_MODEL,
+        num_hidden_layers=_MULTI_SPEC_NUM_LAYERS,
+        qaic_config={"speculative_model_type": "target"},
+    )
+    tlm_qpc = tlm.compile(
+        num_cores=2,
+        prefill_seq_len=_MULTI_SPEC_PREFILL_LEN,
+        ctx_len=_MULTI_SPEC_CTX_LEN,
+        aic_enable_depth_first=True,
+        num_speculative_tokens=decode_ks,
+    )
+
+    # ── 3. Collect vanilla reference logits ──────────────────────────────────
+    van_session = QAICInferenceSession(vanilla_qpc)
+    van_session.skip_buffers([x for x in van_session.input_names if x.startswith("past_")])
+    van_session.skip_buffers([x for x in van_session.output_names if x.endswith("_RetainedState")])
+
+    prefill_logit = _run_prefill(van_session, prefill_inputs, vocab_size)
+    first_token = int(prefill_logit.argmax())
+    ref_tokens, ref_logits = _collect_vanilla_reference(
+        van_session, first_token, input_len, vocab_size, _MULTI_SPEC_N_STEPS
+    )
+    assert len(ref_logits) == _MULTI_SPEC_N_STEPS
+
+    # ── 4. Verify each specialisation ────────────────────────────────────────
+    total_assertions = 0
+    for k in sorted(set(decode_ks)):
+        # Fresh TLM session for each K (resets retained KV state)
+        tlm_session = QAICInferenceSession(tlm_qpc)
+        tlm_session.skip_buffers([x for x in tlm_session.input_names if x.startswith("past_")])
+        tlm_session.skip_buffers([x for x in tlm_session.output_names if x.endswith("_RetainedState")])
+
+        # Prefill TLM (num_logits_to_keep=[[1]])
+        _run_prefill(
+            tlm_session,
+            prefill_inputs,
+            vocab_size,
+            num_logits_to_keep=np.ones((1, 1), dtype=np.int64),
+        )
+
+        n = _verify_tlm_spec(tlm_session, k, ref_tokens, ref_logits, input_len, vocab_size)
+        assert n > 0, f"K={k}: no positions were verified — check _MULTI_SPEC_N_STEPS vs seq_len"
+        total_assertions += n
+
+    assert total_assertions > 0
+    manual_cleanup([vanilla.onnx_path, tlm.onnx_path])

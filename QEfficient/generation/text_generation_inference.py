@@ -16,7 +16,7 @@ import numpy as np
 import transformers
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
-from QEfficient.generation.cloud_infer import QAICInferenceSession
+from QEfficient.generation.cloud_infer import QAICInferenceSession, is_retained_state_name
 from QEfficient.utils import padding_check_and_fix
 from QEfficient.utils.constants import Constants
 from QEfficient.utils.logging_utils import logger
@@ -188,9 +188,12 @@ def get_compilation_dims(qpc_path: str) -> Tuple[int, int, Optional[int]]:
     else:
         raise FileNotFoundError(f"expected specializations.json file at path, {qpc_base_path}")
 
-    compilation_batch_size = int(data["specializations"][0]["batch_size"])
-    compilation_ctx_len = int(data["specializations"][0]["ctx_len"])
-    if compilation_fbs := data["specializations"][0].get("full_batch_size", None):
+    # Support both the legacy flat format and the new {name, symbols} format.
+    first = data["specializations"][0]
+    spec = first.get("symbols", first)
+    compilation_batch_size = int(spec["batch_size"])
+    compilation_ctx_len = int(spec["ctx_len"])
+    if compilation_fbs := spec.get("full_batch_size", None):
         compilation_fbs = int(compilation_fbs)
     return compilation_batch_size, compilation_ctx_len, compilation_fbs
 
@@ -497,7 +500,7 @@ class QEffTextGenerationBase:
         self._set_tokenizer_params()  # set tokenizer params
         # Skip inputs/outputs
         self._session.skip_buffers(
-            [x for x in self._session.input_names + self._session.output_names if x.startswith("past_")]
+            [x for x in self._session.input_names + self._session.output_names if is_retained_state_name(x)]
         )
 
     def _set_tokenizer_params(self):
@@ -716,10 +719,11 @@ class QEffTextGenerationBase:
         next_token_id = self._fetch_next_token_id(outputs)
 
         # Store the generated values.
-        self.decode_input_ids[decode_batch_id or slice(None)] = next_token_id
-        self.decode_pos_ids[decode_batch_id or slice(None)] = position_ids
-        self.generated_ids[decode_batch_id or slice(None), 0] = next_token_id.squeeze(1)
-        self.generation_len[decode_batch_id or slice(None)] = generation_len
+        decode_batch = decode_batch_id if decode_batch_id is not None else slice(None)
+        self.decode_input_ids[decode_batch] = next_token_id
+        self.decode_pos_ids[decode_batch] = position_ids
+        self.generated_ids[decode_batch, 0] = next_token_id.squeeze()
+        self.generation_len[decode_batch] = generation_len
         return next_token_id
 
     def run_prefill_for_all_inputs(self, prompt_queue, generation_len):
@@ -820,7 +824,7 @@ class QEffTextGenerationBase:
 
         if self.comp_ctx_lengths_prefill is not None:
             self.list_of_comp_ctx_lengths_prefill = [
-                np.zeros(length, dtype=np.int8) for length in self.comp_ctx_lengths_prefill
+                np.zeros(length, dtype=np.int64) for length in self.comp_ctx_lengths_prefill
             ]
             prefill_ccl_id = 0
             inputs["comp_ctx_lengths"] = self.list_of_comp_ctx_lengths_prefill[prefill_ccl_id]
@@ -840,6 +844,7 @@ class QEffTextGenerationBase:
             ]
             if self.include_sampler:
                 chunk_inputs["last_accepted_output_tokens"] = chunk_inputs["input_ids"]
+
             outputs = self._session.run(chunk_inputs)
 
             if self._write_io_dir is not None:
@@ -852,7 +857,7 @@ class QEffTextGenerationBase:
 
     def initialize_ccl(self, decode_inputs):
         self.list_of_comp_ctx_lengths_decode = [
-            np.zeros(length, dtype=np.int8) for length in self.comp_ctx_lengths_decode
+            np.zeros(length, dtype=np.int64) for length in self.comp_ctx_lengths_decode
         ]
         max_ccl_id = len(self.comp_ctx_lengths_decode) - 1
         max_position_id = np.max(decode_inputs["position_ids"])
@@ -923,7 +928,7 @@ class QEffTextGenerationBase:
                         new_token_id = self.update_decode_input(outputs, position_ids, generation_len, decode_batch_id)
 
                         batch_id_map[decode_batch_id] = max(batch_id_map.values()) + 1
-                        self.generated_ids[batch_id_map[decode_batch_id], 0] = new_token_id.squeeze(1)
+                        self.generated_ids[batch_id_map[decode_batch_id], 0] = new_token_id.squeeze()
                         generated_id_current_index[decode_batch_id] = 1
 
                         self._set_output_buffers(

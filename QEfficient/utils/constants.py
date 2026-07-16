@@ -6,6 +6,8 @@
 # -----------------------------------------------------------------------------
 
 import os
+import re
+import subprocess
 from dataclasses import dataclass
 
 UTILS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +17,7 @@ QEFF_CACHE_DIR_NAME = "qeff_cache"
 
 ONNX_EXPORT_EXAMPLE_BATCH_SIZE = 1
 ONNX_EXPORT_EXAMPLE_SEQ_LEN = 32
+MOE_PREFILL_PACKED_CHUNK_SIZE = 256
 ONNX_EXPORT_EXAMPLE_FBS = 4
 ONNX_EXPORT_EXAMPLE_NLK = 2  # Number of Logits to Keep
 ONNX_EXPORT_MAX_NUM_IMAGES = 1
@@ -32,6 +35,9 @@ NPI_MAPPING = {
         QEFF_DIR, "transformers", "models", "gemma3", "configs", "gemma_updated_npi.yaml"
     ),
 }
+
+# Blocking defaults
+VTCM_SIZE_THRESHOLD = 8 * 1024 * 1024 * 0.75
 
 # Compiler defaults
 DEFAULT_AIC_NUM_CORES = 16
@@ -98,7 +104,40 @@ SIZE_THRESHOLD_DEFAULT = 1024
 
 
 COMPILER = ["/opt/qti-aic/exec/qaic-compile", "-aic-hw"]
-DEFAULT_AIC_HW_VERSION = "ai100"
+
+
+def get_default_aic_hw_version() -> str:
+    """Detect the AIC hardware version from the first available device.
+
+    Runs ``qaic-util -q`` and inspects the ``FW IMAGE_VARIANT`` field of the
+    first device (QID 0) to determine whether the hardware is ``ai100`` or
+    ``ai200``.  Falls back to ``"ai100"`` when no device is found or the tool
+    is unavailable.
+
+    Returns:
+        str: ``"ai200"`` if an AI200 device is detected, otherwise ``"ai100"``.
+    """
+    qaic_util = "/opt/qti-aic/tools/qaic-util"
+    try:
+        result = subprocess.run(
+            [qaic_util, "-q"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output = result.stdout
+    except Exception:
+        return "ai100"
+
+    match = re.search(r"FW IMAGE_VARIANT\s*:\s*(\S+)", output)
+    if match:
+        variant = match.group(1).upper()
+        if "AIC200" in variant:
+            return "ai200"
+    return "ai100"
+
+
+DEFAULT_AIC_HW_VERSION = get_default_aic_hw_version()
 ONNX_TRANSFORM_MEMORY_CLEANUP_INTERVAL = 100
 
 # InternVL constants
@@ -133,8 +172,12 @@ VISION_MXFP6_MATMUL = False
 LLAMA4_ATTENTION_CHUNK_SIZE = 8192
 LLAMA4_MAX_POSITION_EMBEDDINGS = 65536
 
-# Gemma3 Constant
-GEMMA3_MAX_POSITION_EMBEDDINGS = 32768
+# DeepSeek Kimi-k2 Constant
+MAX_POSITION_EMBEDDINGS = 32768
+FP16_BYTES = 2
+DEFAULT_NUM_HEADS = 64
+KV_LORA_RANK = 512
+ROPE_DIM = 64
 
 # Wav2Vec2 Constant
 WAV2VEC2_MAX_SEQ_LEN = 480000  # 30 seconds of audio at 16 kHz sampling rate (16,000 samples/sec × 30 sec)
@@ -142,6 +185,14 @@ WAV2VEC2_MAX_SEQ_LEN = 480000  # 30 seconds of audio at 16 kHz sampling rate (16
 # Qwen2_5_vl Constants
 QWEN2_5_VL_HEIGHT = 354
 QWEN2_5_VL_WIDTH = 536
+IMAGE_FACTOR_QWEN_2_5 = 28
+IMAGE_MIN_TOKEN_NUM = 4
+IMAGE_MAX_TOKEN_NUM = 16384
+
+# Qwen3_vl Constanst
+QWEN3_VL_HEIGHT = 354
+QWEN3_VL_WIDTH = 536
+IMAGE_FACTOR_QWEN_3 = 32
 
 # Modules to cache while clearing the pytorch weights
 CACHE_MODULES = ["get_output_names", "get_dummy_inputs", "get_onnx_dynamic_axes", "get_specializations"]
@@ -206,7 +257,6 @@ class Constants:
     MAX_QPC_LIMIT = 30
     MAX_RETRIES = 10  # This constant will be used set the maximum number of retry attempts for downloading a model using huggingface_hub snapshot_download
     NUM_SPECULATIVE_TOKENS = 2
-    NUM_KV_BLOCKS = 8
     MAX_TOP_K_IDS = ONNX_EXPORT_EXAMPLE_MAX_TOP_K_IDS
     SAMPLER_OPS = {
         "repetition_penalties",

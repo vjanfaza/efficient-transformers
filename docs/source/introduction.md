@@ -23,6 +23,8 @@ For other models, there is comprehensive documentation to inspire upon the chang
 ***Latest news*** : <br>
 
 - [coming soon] Support for more popular [models](models_coming_soon)<br>
+- [04/2026] Added WAN non-unified execution support in `QEffWanPipeline` with separate `transformer_high` and `transformer_low` modules
+- [04/2026] Added first-block-cache support for WAN non-unified mode and FLUX (`QEffWanPipeline`, `QEffFluxPipeline`)
 - [12/2025] Enabled [disaggregated serving](https://github.com/quic/efficient-transformers/tree/main/examples/disagg_serving) for GPT-OSS model
 - [12/2025] Added support for wav2vec2 Audio Model [facebook/wav2vec2-base-960h](https://huggingface.co/facebook/wav2vec2-base-960h)
 - [12/2025] Added support for diffuser video generation model [WAN 2.2 Model Card](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)
@@ -51,7 +53,7 @@ For other models, there is comprehensive documentation to inspire upon the chang
 - [04/2025] Enabled FP8 model support on [replicate_kv_heads script](https://github.com/quic/efficient-transformers/tree/main/scripts/replicate_kv_head)
 - [04/2025] Added support for [gradient checkpointing](https://github.com/quic/efficient-transformers/pull/338) in the finetuning script
 - [03/2025] Added support for swiftkv model [Snowflake/Llama-3.1-SwiftKV-8B-Instruct](https://huggingface.co/Snowflake/Llama-3.1-SwiftKV-8B-Instruct)
-- [02/2025] [VLMs support](https://github.com/quic/efficient-transformers/pull/267) added for the models [InternVL-1B](https://huggingface.co/OpenGVLab/InternVL2_5-1B), [Llava](https://huggingface.co/llava-hf/llava-1.5-7b-hf) and [Mllama](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)
+- [02/2025] [VLMs support](https://github.com/quic/efficient-transformers/pull/267) added for the models [InternVL-1B](https://huggingface.co/OpenGVLab/InternVL2_5-1B), [Llava](https://huggingface.co/llava-hf/llava-1.5-7b-hf) and [Mllama](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct) *(Mllama support is deprecated — please migrate to Llama-4)*
 - [01/2025] [FP8 models support](https://huggingface.co/collections/neuralmagic/fp8-llms-for-vllm-666742ed2b78b7ac8df13127) Added support for inference of FP8 models.
 - [01/2025] Added support for [Ibm-Granite](https://huggingface.co/ibm-granite/granite-3.1-8b-instruct)
 - [01/2025] Added support for [Ibm-Granite-Guardian](https://huggingface.co/ibm-granite/granite-guardian-3.1-8b)

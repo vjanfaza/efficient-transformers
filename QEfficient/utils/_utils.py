@@ -30,6 +30,116 @@ from QEfficient.utils.constants import KWARGS_INCLUSION_LIST, QEFF_MODELS_DIR, C
 from QEfficient.utils.hash_utils import json_serializable
 from QEfficient.utils.logging_utils import logger
 
+# Retained-state buffer name stems that correspond to per-sequence decoder state vLLM transfers
+# between disaggregated prefill and decode workers: classical attention KV (past_key/past_value),
+# DeepSeek-V3 MLA (compressed_kv/k_pe), and hybrid linear-attention state (conv_state/recurrent_state
+# on Qwen3.5/Qwen3.5-MoE). Vision/multimodal retained buffers (vision_embeds, pixel_values, image_idx,
+# deepstack_features, ...) are intentionally excluded — they are not part of the cross-worker payload.
+_KV_RETAINED_STEMS = (
+    "past_key.",
+    "past_value.",
+    "compressed_kv.",
+    "k_pe.",
+    "conv_state.",
+    "recurrent_state.",
+)
+_RETAINED_STATE_SUFFIX = "_RetainedState"
+_INTERNAL_RETAINED_STATE_SUFFIX = "_InternalRetainedState"
+
+
+def validate_kv_cache_prefix(kv_cache_prefix: Optional[str]) -> Optional[str]:
+    """
+    Validate the optional KV-cache buffer-name prefix.
+
+    The prefix is injected as an infix token into KV retained-state names
+    (``past_key.0_RetainedState`` -> ``past_key.0_<prefix>_RetainedState``), so it must be a plain
+    alphanumeric token. Disallowing ``.`` and ``_`` keeps the ``past_key.{layer}_{prefix}`` structure
+    unambiguous for downstream regex matching.
+
+    Returns the prefix unchanged when valid, or ``None`` when not provided.
+    """
+    if kv_cache_prefix is None:
+        return None
+    if not isinstance(kv_cache_prefix, str) or not kv_cache_prefix.isalnum():
+        raise ValueError(
+            "kv_cache_prefix must be a non-empty alphanumeric string (no '.', '_' or whitespace); "
+            f"got {kv_cache_prefix!r}"
+        )
+    return kv_cache_prefix
+
+
+def _infix_kv_prefix(name: str, kv_cache_prefix: str) -> str:
+    """Insert ``_<prefix>`` before the ``_RetainedState`` suffix for LLM KV-cache buffers only."""
+    if not name.endswith(_RETAINED_STATE_SUFFIX):
+        return name
+    stem = name[: -len(_RETAINED_STATE_SUFFIX)]
+    if not any(stem.startswith(kv_stem) for kv_stem in _KV_RETAINED_STEMS):
+        return name
+    return f"{stem}_{kv_cache_prefix}{_RETAINED_STATE_SUFFIX}"
+
+
+def apply_kv_cache_prefix(output_names, kv_cache_prefix: Optional[str]):
+    """
+    Insert an infix token into LLM KV-cache retained-state output names.
+
+    ``past_key.0_RetainedState`` -> ``past_key.0_<prefix>_RetainedState`` (and likewise for
+    ``past_value`` / ``compressed_kv`` / ``k_pe``). The matching device input buffer is named by the
+    compiler by stripping ``_RetainedState`` (``past_key.0_<prefix>``), so KV retention pairing is
+    preserved. Vision/multimodal retained buffers are left untouched.
+
+    Accepts either a flat ``List[str]`` (CausalLM / single-QPC VLM) or the
+    ``{"vision": [...], "lang": [...]}`` dict (dual-QPC VLM); for the dict form only the ``lang`` list
+    is rewritten. No-op when ``kv_cache_prefix`` is falsy. The input is not mutated in place.
+    """
+    if not kv_cache_prefix:
+        return output_names
+    validate_kv_cache_prefix(kv_cache_prefix)
+
+    if isinstance(output_names, dict):
+        result = dict(output_names)
+        if result.get("lang") is not None:
+            result["lang"] = [_infix_kv_prefix(name, kv_cache_prefix) for name in result["lang"]]
+        return result
+    return [_infix_kv_prefix(name, kv_cache_prefix) for name in output_names]
+
+
+def align_kv_input_names_to_retained_outputs(input_names, output_names):
+    """
+    Rename KV-cache *input* buffers so each pairs with its retained-state *output*.
+
+    The AIC compiler retains a KV buffer by matching an output ``X_RetainedState`` to the input named
+    ``X`` (suffix stripped). When the retained outputs carry an injected prefix
+    (``past_key.0_<prefix>_RetainedState``), the corresponding input must be renamed from
+    ``past_key.0`` to ``past_key.0_<prefix>`` for the pairing to hold.
+
+    This derives the rename purely from ``output_names`` (which already carry any prefix), so callers
+    that build prefixed outputs do not need to thread the prefix separately. It is a no-op for inputs
+    that already match a retained output exactly, and for non-KV inputs. ``input_names`` is not mutated.
+    """
+    # Stripped target names from retained KV outputs, e.g. {"past_key.0_VLLM", "past_value.0_VLLM"}.
+    retained_targets = []
+    for name in output_names:
+        stem = None
+        if name.endswith(_RETAINED_STATE_SUFFIX):
+            stem = name[: -len(_RETAINED_STATE_SUFFIX)]
+        elif name.endswith(_INTERNAL_RETAINED_STATE_SUFFIX):
+            stem = name[: -len(_INTERNAL_RETAINED_STATE_SUFFIX)]
+        if stem is None:
+            continue
+        if any(stem.startswith(kv_stem) for kv_stem in _KV_RETAINED_STEMS):
+            retained_targets.append(stem)
+    retained_set = set(retained_targets)
+
+    aligned = []
+    for name in input_names:
+        if not any(name.startswith(stem) for stem in _KV_RETAINED_STEMS) or name in retained_set:
+            aligned.append(name)
+            continue
+        # Find a retained target that is this input with an extra "_<prefix>" infix.
+        match = next((t for t in retained_targets if t == name or t.startswith(name + "_")), None)
+        aligned.append(match if match is not None else name)
+    return aligned
+
 
 class LRUCache:
     """Simple LRU cache with size limit for vision outputs"""
@@ -316,7 +426,11 @@ def padding_check_and_fix(tokenizer: Union[PreTrainedTokenizer, PreTrainedTokeni
 
 
 def get_sliding_window_layers(config):
-    return torch.tensor([bool((i + 1) % 4) for i in range(config.num_hidden_layers)], dtype=torch.bool)
+    if hasattr(config, "layer_types") and config.layer_types is not None:
+        return torch.tensor([layer_type == "sliding_attention" for layer_type in config.layer_types], dtype=torch.bool)
+
+    pattern = getattr(config, "sliding_window_pattern", 4)
+    return torch.tensor([bool((i + 1) % pattern) for i in range(config.num_hidden_layers)], dtype=torch.bool)
 
 
 def get_sliding_window_shapes(config, batch_size, seq_len):
@@ -638,32 +752,6 @@ def create_json(file_path: str, json_data: object):
         print(f"Failed to create JSON File {file_path}: {e}")
 
 
-def generate_mdp_partition_config(num_devices: int, num_cores: int) -> str:
-    """
-    Generates an MDP partition configuration JSON file using the create_json utility.
-
-    Args:
-        num_devices (int): Number of devices.
-        num_cores (int): Number of cores per device.
-        output_dir (str): Directory where the JSON file will be saved.
-
-    Returns:
-        str: Path to the generated JSON file.
-    """
-
-    mdp_config = {
-        "connections": [{"devices": list(range(num_devices)), "type": "p2p"}],
-        "partitions": [
-            {
-                "name": "Partition0",
-                "devices": [{"deviceId": d, "numCores": num_cores} for d in range(num_devices)],
-            }
-        ],
-    }
-
-    return mdp_config
-
-
 def model_swap(func):
     def wrapper(*args, **kwargs):
         if "model" in kwargs and kwargs["model"] is not None:
@@ -702,9 +790,16 @@ class IOInfo:
 def dump_qconfig(func):
     def wrapper(self, *args, **kwargs):
         result = func(self, *args, **kwargs)
+        # Skip qconfig dumping when no QPC was actually produced (e.g. the
+        # layer-wise export short-circuits compile to return an ONNX path).
+        # Without this guard we'd hit a TypeError inside create_and_dump_qconfigs
+        # and surface a confusing user-facing message.
+        qpc_path = getattr(self, "qpc_path", None)
+        if qpc_path is None:
+            return result
         try:
             create_and_dump_qconfigs(
-                self.qpc_path,
+                qpc_path,
                 self.onnx_path,
                 self.get_model_config,
                 [cls.__name__ for cls in self._pytorch_transforms],
@@ -720,7 +815,7 @@ def dump_qconfig(func):
                 },
             )
         except Exception as e:
-            print(f"An unexpected error occurred while dumping the qconfig: {e}")
+            logger.debug("Skipping qconfig dump: %s", e)
         return result
 
     return wrapper
@@ -837,3 +932,136 @@ def custom_format_warning(msg, category, *args, **kwargs):
     YELLOW = "\033[93m"
     RESET = "\033[0m"
     return f"{YELLOW}[Warning]: {msg}{RESET}\n"
+
+
+def _infer_specialization_name(spec: Dict, index: int, module_name: Optional[str] = None) -> str:
+    """
+    Infer a human-readable name for a specialization entry.
+
+    Priority order:
+    1. ``_graph_name`` key inside ``spec`` — set at the point of creation by
+       ``build_prefill_specialization``, ``build_decode_specialization``,
+       VLM ``get_specializations``, Whisper ``get_specializations``, and
+       ``pipeline_utils`` compile helpers.  This is the authoritative source
+       and requires no heuristics.
+    2. ``module_name`` argument — used by diffusers pipeline modules where the
+       module name itself is the graph name (e.g. ``"text_encoder"``).
+    3. ``seq_len`` heuristic — reliable fallback for plain causal LM specs that
+       do not carry ``_graph_name`` (e.g. user-supplied raw dicts, legacy paths).
+       ``seq_len != 1`` → ``"Prefill"``, ``seq_len == 1`` → ``"Decode"``.
+    4. ``encoder_ctx_len`` with no ``seq_len`` → ``"Encoder"`` (simplified
+       Whisper-like spec without ``feature_len``).
+    5. Legacy ``sequence_length`` with no ``seq_len`` → ``"Embedding"``
+       (older BERT-like raw dicts). Current embedding compile paths set
+       ``_graph_name="Embedding"`` and still use ``seq_len``.
+    6. Generic fallback ``f"Graph_{index}"``.
+
+    Parameters
+    ----------
+    spec : Dict
+        A single flat specialization dictionary (key → value).  May contain
+        the reserved ``_graph_name`` key which is consumed here and never
+        written to ``symbols``.
+    index : int
+        Zero-based position in the specializations list, used only for the
+        generic fallback name.
+    module_name : str, optional
+        Explicit graph name hint for diffusers pipeline modules.
+
+    Returns
+    -------
+    str
+        The inferred graph name.
+    """
+    # 1. Authoritative tag set at creation time — no heuristics needed.
+    if "_graph_name" in spec:
+        return spec["_graph_name"]
+
+    # 2. Explicit module name (diffusers pipeline path).
+    if module_name is not None:
+        if "model_type" in spec:
+            return f"{module_name}_model_type_{spec['model_type']}"
+        return module_name
+
+    # 3-6. Heuristic fallback — only reached for raw/legacy dicts.
+    if "seq_len" not in spec:
+        if "encoder_ctx_len" in spec:
+            return "Encoder"
+        # Legacy fallback for older BERT-style raw dicts. Current embedding
+        # compile paths set _graph_name="Embedding" and use seq_len.
+        if "sequence_length" in spec:
+            return "Embedding"
+        return f"Graph_{index}"
+    seq_len = spec["seq_len"]
+    if str(seq_len) == "1":
+        return "Decode"
+    return "Prefill"
+
+
+def to_named_specializations(specializations: List[Dict], module_name: Optional[str] = None) -> List[Dict]:
+    """
+    Convert flat specialization dicts to the nested ``{name, symbols}`` format
+    expected by the backend compiler.
+
+    Example output (one entry)::
+
+        {"name": "Prefill", "symbols": {"batch_size": "1", "seq_len": "128", "ctx_len": "4096"}}
+
+    For diffusers pipeline modules pass ``module_name`` so the graph name reflects
+    the module (e.g. ``"text_encoder"``, ``"vae_decoder"``, ``"transformer_model_type_1"``).
+
+    Parameters
+    ----------
+    specializations : List[Dict]
+        List of flat specialization dicts (values may be int or str).
+    module_name : str, optional
+        Pipeline module name forwarded to ``_infer_specialization_name``.
+
+    Returns
+    -------
+    List[Dict]
+        List of ``{"name": str, "symbols": Dict[str, str]}`` dicts.
+    """
+    result = []
+    for index, spec in enumerate(specializations):
+        # Idempotent: already in named format, pass through unchanged.
+        if set(spec.keys()) == {"name", "symbols"}:
+            result.append(spec)
+            continue
+        name = _infer_specialization_name(spec, index, module_name=module_name)
+        # Strip the internal _graph_name tag — it must not appear in symbols.
+        symbols = {k: str(v) for k, v in spec.items() if k != "_graph_name"}
+        result.append({"name": name, "symbols": symbols})
+
+    # Deduplicate names: if two entries share the same inferred name (e.g. both
+    # have seq_len=1 in a raw-dict override path), append a positional suffix so
+    # the compiler never sees duplicate graph names.
+    seen: Dict[str, int] = {}
+    for entry in result:
+        name = entry["name"]
+        if name in seen:
+            # Rename the first occurrence retroactively on its second encounter
+            if seen[name] == 1:
+                first_idx = next(i for i, e in enumerate(result) if e["name"] == name)
+                result[first_idx] = {**result[first_idx], "name": f"{name}_0"}
+            entry["name"] = f"{name}_{seen[name]}"
+        seen[name] = seen.get(name, 0) + 1
+
+    return result
+
+
+def get_attr_or_key(obj: Any, names: Tuple[str, ...], default: Any = None) -> Any:
+    if obj is None:
+        return default
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def require_value(value: Any, label: str) -> Any:
+    if value is None:
+        raise ValueError(f"Missing required {label} to compute blocking configuration.")
+    return value

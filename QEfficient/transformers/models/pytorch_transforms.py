@@ -6,10 +6,10 @@
 # -----------------------------------------------------------------------------
 
 import warnings
-from functools import partial
 from types import MethodType
 from typing import Callable, Optional, Tuple, Union
 
+import torch
 from torch import nn
 from transformers.models.codegen.modeling_codegen import (
     CodeGenAttention,
@@ -48,6 +48,28 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3RMSNorm,
     Gemma3TextModel,
 )
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ClippableLinear,
+    Gemma4ForCausalLM,
+    Gemma4ForConditionalGeneration,
+    Gemma4RMSNorm,
+    Gemma4TextAttention,
+    Gemma4TextDecoderLayer,
+    Gemma4TextExperts,
+    Gemma4TextModel,
+    Gemma4TextRouter,
+    Gemma4VisionAttention,
+)
+from transformers.models.glm4_moe.modeling_glm4_moe import (
+    Glm4MoeAttention,
+    Glm4MoeDecoderLayer,
+    Glm4MoeForCausalLM,
+    Glm4MoeModel,
+    Glm4MoeMoE,
+    Glm4MoeRMSNorm,
+    Glm4MoeRotaryEmbedding,
+    Glm4MoeTopkRouter,
+)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeAttention,
@@ -74,6 +96,7 @@ from transformers.models.granite.modeling_granite import (
 )
 from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeAttention,
+    GraniteMoeDecoderLayer,
     GraniteMoeForCausalLM,
     GraniteMoeModel,
     GraniteMoeMoE,
@@ -174,10 +197,14 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
+    Qwen2_5_VLVisionBlock,
 )
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2RMSNorm as Qwen2_5RMSNorm,
-)
+
+try:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2RMSNorm as Qwen2_5RMSNorm
+except ImportError:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLRMSNorm as Qwen2_5RMSNorm
+from transformers.models.bert.modeling_bert import BertModel
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
@@ -185,15 +212,71 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Model,
     Qwen3RMSNorm,
 )
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Attention,
+    Qwen3_5DecoderLayer,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5Model,
+    Qwen3_5RMSNorm,
+    Qwen3_5RMSNormGated,
+    Qwen3_5TextModel,
+    Qwen3_5VisionAttention,
+    Qwen3_5VisionModel,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeAttention,
+    Qwen3_5MoeDecoderLayer,
+    Qwen3_5MoeExperts,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeGatedDeltaNet,
+    Qwen3_5MoeModel,
+    Qwen3_5MoeRMSNorm,
+    Qwen3_5MoeRMSNormGated,
+    Qwen3_5MoeSparseMoeBlock,
+    Qwen3_5MoeTextModel,
+    Qwen3_5MoeTopKRouter,
+    Qwen3_5MoeVisionAttention,
+    Qwen3_5MoeVisionModel,
+)
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeAttention,
     Qwen3MoeDecoderLayer,
+    Qwen3MoeExperts,
     Qwen3MoeForCausalLM,
     Qwen3MoeModel,
     Qwen3MoeRMSNorm,
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeSparseMoeBlock,
+    Qwen3MoeTopKRouter,
 )
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLModel,
+    Qwen3VLTextAttention,
+    Qwen3VLTextDecoderLayer,
+    Qwen3VLTextModel,
+    Qwen3VLTextRMSNorm,
+    Qwen3VLTextRotaryEmbedding,
+    Qwen3VLVisionAttention,
+    Qwen3VLVisionModel,
+)
+from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+    Qwen3VLMoeForConditionalGeneration,
+    Qwen3VLMoeModel,
+    Qwen3VLMoeTextAttention,
+    Qwen3VLMoeTextDecoderLayer,
+    Qwen3VLMoeTextExperts,
+    Qwen3VLMoeTextModel,
+    Qwen3VLMoeTextRMSNorm,
+    Qwen3VLMoeTextRotaryEmbedding,
+    Qwen3VLMoeTextSparseMoeBlock,
+    Qwen3VLMoeTextTopKRouter,
+    Qwen3VLMoeVisionAttention,
+    Qwen3VLMoeVisionModel,
+)
+from transformers.models.roberta.modeling_roberta import RobertaModel
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
     Starcoder2DecoderLayer,
@@ -203,6 +286,11 @@ from transformers.models.starcoder2.modeling_starcoder2 import (
 from transformers.models.t5.modeling_t5 import (
     T5Attention,
     T5LayerNorm,
+    T5Stack,
+)
+from transformers.models.wav2vec2.modeling_wav2vec2 import (
+    Wav2Vec2Encoder,
+    Wav2Vec2EncoderStableLayerNorm,
 )
 from transformers.models.whisper.modeling_whisper import (
     WhisperAttention,
@@ -213,10 +301,16 @@ from transformers.models.whisper.modeling_whisper import (
     WhisperModel,
     WhisperPositionalEmbedding,
 )
+from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaModel
 
 from QEfficient.base.pytorch_transforms import ExternalModuleMapperTransform, ModuleMappingTransform
 from QEfficient.customop import CustomRMSNormAIC, GemmaCustomRMSNormAIC
 from QEfficient.transformers.embeddings.embedding_utils import POOLING_MAP, PooledModel, validate_user_pooling_function
+from QEfficient.transformers.models.bert.modeling_bert import (
+    QEffBertModel,
+    QEffRobertaModel,
+    QEffXLMRobertaModel,
+)
 from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenAttention,
     QEffCodeGenBlock,
@@ -225,6 +319,15 @@ from QEfficient.transformers.models.codegen.modeling_codegen import (
 )
 from QEfficient.transformers.models.deberta_v2.modeling_deberta_v2 import (
     QEffDisentangledSelfAttention,
+)
+from QEfficient.transformers.models.deepseek_v3.modeling_deepseek import (
+    QEffDeepseekV3Attention,
+    QEffDeepseekV3CustomRMSNormAIC,
+    QEffDeepseekV3DecoderLayer,
+    QEffDeepseekV3ForCausalLM,
+    QEffDeepseekV3Model,
+    QEffDeepseekV3MoE,
+    QEffPrefillOnlyDeepseekV3MoE,
 )
 from QEfficient.transformers.models.falcon.modeling_falcon import (
     QEffFalconAttention,
@@ -252,6 +355,29 @@ from QEfficient.transformers.models.gemma3.modeling_gemma3 import (
     QEffGemma3ForCausalLMModel,
     QEffGemma3ForConditionalGeneration,
     QEffGemma3TextModel,
+)
+from QEfficient.transformers.models.gemma4.modeling_gemma4 import (
+    QEffGemma4ClippableLinear,
+    QEffGemma4CustomRMSNormAIC,
+    QEffGemma4ForCausalLM,
+    QEffGemma4ForConditionalGeneration,
+    QEffGemma4TextAttention,
+    QEffGemma4TextDecoderLayer,
+    QEffGemma4TextExperts,
+    QEffGemma4TextModel,
+    QEffGemma4TextRouter,
+    QEffGemma4VisionAttention,
+    QEffPrefillChunckedGemma4TextExperts,
+)
+from QEfficient.transformers.models.glm4_moe.modeling_glm4_moe import (
+    QEffGlm4MoeAttention,
+    QEffGlm4MoeDecoderLayer,
+    QEffGlm4MoeForCausalLM,
+    QEffGlm4MoeModel,
+    QEffGlm4MoeMoE,
+    QEffGlm4MoeRotaryEmbedding,
+    QEffGlm4MoeTopkRouter,
+    QEffPrefillChunkedGlm4MoeMoE,
 )
 from QEfficient.transformers.models.gpt2.modeling_gpt2 import (
     QEffGPT2Attention,
@@ -292,6 +418,7 @@ from QEfficient.transformers.models.granite.modeling_granite import (
 )
 from QEfficient.transformers.models.granitemoe.modeling_granitemoe import (
     QEffGraniteMoeAttention,
+    QEffGraniteMoeDecoderLayer,
     QEffGraniteMoeForCausalLM,
     QEffGraniteMoeModel,
     QEffGraniteMoeMoE,
@@ -415,6 +542,7 @@ from QEfficient.transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     QEffQwen2_5_VLModel,
     QEffQwen2_5_VLTextModel,
     QEffQwen2_5_VLVisionAttention,
+    QEffQwen2_5_VLVisionBlock,
     QEffQwen_2_5_vl_DecoderWrapper,
     QEffQwen_2_5_vl_ForConditionalGeneration,
 )
@@ -424,14 +552,67 @@ from QEfficient.transformers.models.qwen3.modeling_qwen3 import (
     QEffQwen3ForCausalLM,
     QEffQwen3Model,
 )
+from QEfficient.transformers.models.qwen3_5.modeling_qwen3_5 import (
+    QEffQwen3_5Attention,
+    QEffQwen3_5DecoderLayer,
+    QEffQwen3_5ForConditionalGeneration,
+    QEffQwen3_5GatedDeltaNet,
+    QEffQwen3_5GatedDeltaNetCustomRMSNormAIC,
+    QEffQwen3_5Model,
+    QEffQwen3_5TextModel,
+    QEffQwen3_5VisionAttention,
+    QEffQwen3_5VisionModel,
+)
+from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    QEffPrefillChunkedQwen3_5MoeSparseMoeBlock,
+    QEffQwen3_5MoeAttention,
+    QEffQwen3_5MoeDecoderLayer,
+    QEffQwen3_5MoeExperts,
+    QEffQwen3_5MoeForCausalLM,
+    QEffQwen3_5MoeForConditionalGeneration,
+    QEffQwen3_5MoeGatedDeltaNet,
+    QEffQwen3_5MoeGatedDeltaNetCustomRMSNormAIC,
+    QEffQwen3_5MoeModel,
+    QEffQwen3_5MoeSparseMoeBlock,
+    QEffQwen3_5MoeTextModel,
+    QEffQwen3_5MoeTopKRouter,
+    QEffQwen3_5MoeVisionAttention,
+    QEffQwen3_5MoeVisionModel,
+)
 from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import (
     QEffPrefillChunkedQwen3MoeSparseMoeBlock,
     QEffQwen3MoeAttention,
     QEffQwen3MoeDecoderLayer,
+    QEffQwen3MoeExperts,
     QEffQwen3MoeForCausalLM,
     QEffQwen3MoeModel,
     QEffQwen3MoeRotaryEmbedding,
     QEffQwen3MoeSparseMoeBlock,
+    QEffQwen3MoeTopKRouter,
+)
+from QEfficient.transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    QEffQwen3VLForConditionalGeneration,
+    QEffQwen3VLModel,
+    QEffQwen3VLTextAttention,
+    QEffQwen3VLTextDecoderLayer,
+    QEffQwen3VLTextModel,
+    QEffQwen3VLTextRotaryEmbedding,
+    QEffQwen3VLVisionAttention,
+    QEffQwen3VLVisionModel,
+)
+from QEfficient.transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+    QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
+    QEffQwen3VLMoeForConditionalGeneration,
+    QEffQwen3VLMoeModel,
+    QEffQwen3VLMoeTextAttention,
+    QEffQwen3VLMoeTextDecoderLayer,
+    QEffQwen3VLMoeTextExperts,
+    QEffQwen3VLMoeTextModel,
+    QEffQwen3VLMoeTextRotaryEmbedding,
+    QEffQwen3VLMoeTextSparseMoeBlock,
+    QEffQwen3VLMoeTextTopKRouter,
+    QEffQwen3VLMoeVisionAttention,
+    QEffQwen3VLMoeVisionModel,
 )
 from QEfficient.transformers.models.starcoder2.modeling_starcoder2 import (
     QEffStarcoder2Attention,
@@ -442,6 +623,11 @@ from QEfficient.transformers.models.starcoder2.modeling_starcoder2 import (
 from QEfficient.transformers.models.t5.modeling_t5 import (
     QEffT5Attention,
     QEffT5LayerNorm,
+    QEffT5Stack,
+)
+from QEfficient.transformers.models.wav2vec2.modeling_wav2vec2 import (
+    QEffWav2Vec2Encoder,
+    QEffWav2Vec2EncoderStableLayerNorm,
 )
 from QEfficient.transformers.models.whisper.modeling_whisper import (
     QEffWhisperAttention,
@@ -455,6 +641,7 @@ from QEfficient.transformers.models.whisper.modeling_whisper import (
 from QEfficient.transformers.post_processing import build_and_attach_mlp, model_type_registry
 from QEfficient.transformers.sampler.sampler import sampler_forward
 from QEfficient.transformers.spd.spd_transform_forward import tlm_forward
+from QEfficient.utils.logging_utils import logger
 
 SPD_TARGET = "target"
 
@@ -479,12 +666,35 @@ class CustomOpsTransform(ModuleMappingTransform):
         GraniteMoeRMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
+        Gemma4RMSNorm: QEffGemma4CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
+        Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
+        Qwen3VLTextRMSNorm: CustomRMSNormAIC,
+        Glm4MoeRMSNorm: CustomRMSNormAIC,
+        Wav2Vec2Encoder: QEffWav2Vec2Encoder,
+        Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
+        # BERT-family: replace _create_attention_masks (uses create_bidirectional_mask,
+        # which breaks ONNX tracing) with an ONNX-safe _prepare_4d_attention_mask version.
+        BertModel: QEffBertModel,
+        RobertaModel: QEffRobertaModel,
+        XLMRobertaModel: QEffXLMRobertaModel,
+        Qwen3_5RMSNorm: GemmaCustomRMSNormAIC,
+        Qwen3_5MoeRMSNorm: GemmaCustomRMSNormAIC,
+        Qwen3_5RMSNormGated: QEffQwen3_5GatedDeltaNetCustomRMSNormAIC,
+        Qwen3_5MoeRMSNormGated: QEffQwen3_5MoeGatedDeltaNetCustomRMSNormAIC,
     }
 
 
 class KVCacheTransform(ModuleMappingTransform):
     _module_mapping = {
+        # GLMMoe
+        Glm4MoeModel: QEffGlm4MoeModel,
+        Glm4MoeForCausalLM: QEffGlm4MoeForCausalLM,
+        Glm4MoeAttention: QEffGlm4MoeAttention,
+        Glm4MoeDecoderLayer: QEffGlm4MoeDecoderLayer,
+        Glm4MoeRotaryEmbedding: QEffGlm4MoeRotaryEmbedding,
+        Glm4MoeMoE: QEffGlm4MoeMoE,
+        Glm4MoeTopkRouter: QEffGlm4MoeTopkRouter,
         # CodeGen
         CodeGenAttention: QEffCodeGenAttention,
         CodeGenBlock: QEffCodeGenBlock,
@@ -537,18 +747,50 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3MoeDecoderLayer: QEffQwen3MoeDecoderLayer,
         Qwen3MoeAttention: QEffQwen3MoeAttention,
         Qwen3MoeRotaryEmbedding: QEffQwen3MoeRotaryEmbedding,
+        Qwen3MoeExperts: QEffQwen3MoeExperts,
         Qwen3MoeSparseMoeBlock: QEffQwen3MoeSparseMoeBlock,
+        Qwen3MoeTopKRouter: QEffQwen3MoeTopKRouter,
+        # Qwen3VLMoe
+        Qwen3VLMoeForConditionalGeneration: QEffQwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel: QEffQwen3VLMoeModel,
+        Qwen3VLMoeTextAttention: QEffQwen3VLMoeTextAttention,
+        Qwen3VLMoeTextDecoderLayer: QEffQwen3VLMoeTextDecoderLayer,
+        Qwen3VLMoeVisionAttention: QEffQwen3VLMoeVisionAttention,
+        Qwen3VLMoeVisionModel: QEffQwen3VLMoeVisionModel,
+        Qwen3VLMoeTextModel: QEffQwen3VLMoeTextModel,
+        Qwen3VLMoeTextExperts: QEffQwen3VLMoeTextExperts,
+        Qwen3VLMoeTextSparseMoeBlock: QEffQwen3VLMoeTextSparseMoeBlock,
+        Qwen3VLMoeTextRotaryEmbedding: QEffQwen3VLMoeTextRotaryEmbedding,
+        Qwen3VLMoeTextTopKRouter: QEffQwen3VLMoeTextTopKRouter,
+        # Qwen3vl
+        Qwen3VLForConditionalGeneration: QEffQwen3VLForConditionalGeneration,
+        Qwen3VLModel: QEffQwen3VLModel,
+        Qwen3VLTextAttention: QEffQwen3VLTextAttention,
+        Qwen3VLTextDecoderLayer: QEffQwen3VLTextDecoderLayer,
+        Qwen3VLVisionAttention: QEffQwen3VLVisionAttention,
+        Qwen3VLVisionModel: QEffQwen3VLVisionModel,
+        Qwen3VLTextModel: QEffQwen3VLTextModel,
+        Qwen3VLTextRotaryEmbedding: QEffQwen3VLTextRotaryEmbedding,
         # Gemma2
         Gemma2Attention: QEffGemma2Attention,
         Gemma2DecoderLayer: QEffGemma2DecoderLayer,
         Gemma2Model: QEffGemma2Model,
         Gemma2ForCausalLM: QEffGemma2ForCausalLM,
-        # Gemma3
         Gemma3Attention: QEffGemma3Attention,
         Gemma3DecoderLayer: QEffGemma3DecoderLayer,
         Gemma3TextModel: QEffGemma3TextModel,
         Gemma3ForCausalLM: QEffGemma3ForCausalLMModel,
         Gemma3ForConditionalGeneration: QEffGemma3ForConditionalGeneration,
+        # Gemma4
+        Gemma4TextAttention: QEffGemma4TextAttention,
+        Gemma4TextDecoderLayer: QEffGemma4TextDecoderLayer,
+        Gemma4TextModel: QEffGemma4TextModel,
+        Gemma4ForCausalLM: QEffGemma4ForCausalLM,
+        Gemma4ForConditionalGeneration: QEffGemma4ForConditionalGeneration,
+        Gemma4TextExperts: QEffGemma4TextExperts,
+        Gemma4TextRouter: QEffGemma4TextRouter,
+        Gemma4VisionAttention: QEffGemma4VisionAttention,
+        Gemma4ClippableLinear: QEffGemma4ClippableLinear,
         # GPT_OSS
         GptOssAttention: QEffGptOssAttention,
         GptOssDecoderLayer: QEffGptOssDecoderLayer,
@@ -569,6 +811,7 @@ class KVCacheTransform(ModuleMappingTransform):
         GraniteMoeParallelExperts: QEffGraniteMoeParallelExperts,
         GraniteMoeTopKGating: QEffGraniteMoeTopKGating,
         GraniteMoeMoE: QEffGraniteMoeMoE,
+        GraniteMoeDecoderLayer: QEffGraniteMoeDecoderLayer,
         # mllama
         MllamaTextRMSNorm: CustomRMSNormAIC,
         MllamaTextSelfAttention: QEffMllamaTextSelfAttention,
@@ -621,6 +864,28 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3DecoderLayer: QEffQwen3DecoderLayer,
         Qwen3Model: QEffQwen3Model,
         Qwen3ForCausalLM: QEffQwen3ForCausalLM,
+        # Qwen3_5
+        Qwen3_5GatedDeltaNet: QEffQwen3_5GatedDeltaNet,
+        Qwen3_5DecoderLayer: QEffQwen3_5DecoderLayer,
+        Qwen3_5TextModel: QEffQwen3_5TextModel,
+        Qwen3_5Model: QEffQwen3_5Model,
+        Qwen3_5ForConditionalGeneration: QEffQwen3_5ForConditionalGeneration,
+        Qwen3_5Attention: QEffQwen3_5Attention,
+        Qwen3_5VisionAttention: QEffQwen3_5VisionAttention,
+        Qwen3_5VisionModel: QEffQwen3_5VisionModel,
+        # Qwen3_5_Moe
+        Qwen3_5MoeGatedDeltaNet: QEffQwen3_5MoeGatedDeltaNet,
+        Qwen3_5MoeDecoderLayer: QEffQwen3_5MoeDecoderLayer,
+        Qwen3_5MoeTextModel: QEffQwen3_5MoeTextModel,
+        Qwen3_5MoeModel: QEffQwen3_5MoeModel,
+        Qwen3_5MoeForConditionalGeneration: QEffQwen3_5MoeForConditionalGeneration,
+        Qwen3_5MoeForCausalLM: QEffQwen3_5MoeForCausalLM,
+        Qwen3_5MoeAttention: QEffQwen3_5MoeAttention,
+        Qwen3_5MoeExperts: QEffQwen3_5MoeExperts,
+        Qwen3_5MoeSparseMoeBlock: QEffQwen3_5MoeSparseMoeBlock,
+        Qwen3_5MoeVisionAttention: QEffQwen3_5MoeVisionAttention,
+        Qwen3_5MoeVisionModel: QEffQwen3_5MoeVisionModel,
+        Qwen3_5MoeTopKRouter: QEffQwen3_5MoeTopKRouter,
         # Qwen2.5 VL
         Qwen2_5_VLForConditionalGeneration: QEffQwen_2_5_vl_ForConditionalGeneration,
         Qwen2_5_VLModel: QEffQwen2_5_VLModel,
@@ -628,6 +893,7 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen2_5_VLDecoderLayer: QEffQwen2_5_VLDecoderLayer,
         Qwen2_5_VisionTransformerPretrainedModel: QEffQwen2_5_VisionTransformerPretrainedModel,
         Qwen2_5_VLVisionAttention: QEffQwen2_5_VLVisionAttention,
+        Qwen2_5_VLVisionBlock: QEffQwen2_5_VLVisionBlock,
         Qwen2_5_VLTextModel: QEffQwen2_5_VLTextModel,
         # Starcoder2
         Starcoder2Attention: QEffStarcoder2Attention,
@@ -665,6 +931,10 @@ class PrefillOnlyTransform(ModuleMappingTransform):
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffGptOssAttention: QEffPrefillOnlyGptOssAttention,
         QEffGptOssMLP: QEffPrefillOnlyGptOssMLP,
+        QEffGlm4MoeMoE: QEffPrefillChunkedGlm4MoeMoE,
+        QEffQwen3MoeSparseMoeBlock: QEffPrefillChunkedQwen3MoeSparseMoeBlock,
+        QEffQwen3VLMoeTextSparseMoeBlock: QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
+        QEffQwen3_5MoeSparseMoeBlock: QEffPrefillChunkedQwen3_5MoeSparseMoeBlock,
     }
 
 
@@ -676,6 +946,14 @@ class PrefillOnlyChunkedTransform(ModuleMappingTransform):
         QEffGptOssMLP: QEffPrefillOnlyChunkedGptOssMLP,
         # Qwen3Moe
         QEffQwen3MoeSparseMoeBlock: QEffPrefillChunkedQwen3MoeSparseMoeBlock,
+        # Qwen3 VL Moe
+        QEffQwen3VLMoeTextSparseMoeBlock: QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
+        # GLM4 Moe
+        QEffGlm4MoeMoE: QEffPrefillChunkedGlm4MoeMoE,
+        # Qwen3_5Moe
+        QEffQwen3_5MoeSparseMoeBlock: QEffPrefillChunkedQwen3_5MoeSparseMoeBlock,
+        # Gemma4_Moe
+        QEffGemma4TextExperts: QEffPrefillChunckedGemma4TextExperts,
     }
 
 
@@ -689,6 +967,14 @@ class RevertPrefillKeepAttentionTransform(ModuleMappingTransform):
         QEffPrefillOnlyChunkedGptOssMLP: QEffGptOssMLP,
         # Qwen3Moe
         QEffPrefillChunkedQwen3MoeSparseMoeBlock: QEffQwen3MoeSparseMoeBlock,
+        # GLM4 Moe
+        QEffPrefillChunkedGlm4MoeMoE: QEffGlm4MoeMoE,
+        # Qwen3 VL Moe
+        QEffQwen3VLMoeTextSparseMoeBlock: QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
+        # Qwen3_5Moe
+        QEffPrefillChunkedQwen3_5MoeSparseMoeBlock: QEffQwen3_5MoeSparseMoeBlock,
+        # Gemma4_Moe
+        QEffPrefillChunckedGemma4TextExperts: QEffGemma4TextExperts,
     }
 
 
@@ -697,6 +983,76 @@ class RevertPrefillOnlyTransform(ModuleMappingTransform):
         **{v: k for k, v in PrefillOnlyTransform._module_mapping.items()},
         **{v: k for k, v in PrefillOnlyChunkedTransform._module_mapping.items()},
     }
+
+
+class ReplicateKVHeadTransform:
+    """
+    Replicates KV heads in attention modules to match the number of KV heads in the target model.
+    This transform is used when the source model has fewer KV heads than required in target model.
+    """
+
+    def _duplicate_weights_for_linear_layer(
+        layer: nn.Module, orig_kv_heads: int, repeat: int, dim: int, hidden_size: int
+    ):
+        new_kv_heads = repeat  # for mla
+
+        layer.weight.data = torch.repeat_interleave(
+            layer.weight.data.view(orig_kv_heads, dim, hidden_size), repeat, 0
+        ).view(new_kv_heads * dim, hidden_size)
+
+        if layer.bias is not None:
+            layer.bias.data = torch.repeat_interleave(layer.bias.data.view(orig_kv_heads, dim), repeat, 0).view(
+                new_kv_heads * dim
+            )
+
+    def _get_text_model(model):
+        """
+        Determine and return the appropriate text_model from a given model object.
+        """
+        # Check for VLMs
+        if hasattr(model, "language_model"):
+            if hasattr(model.language_model, "model"):
+                return model.language_model.model
+            else:
+                return model.language_model
+        # Check for CausalLMs
+        if hasattr(model, "model"):
+            return model.model
+
+        raise AttributeError("No suitable text model found in the provided model.")
+
+    @classmethod
+    def apply(cls, model: nn.Module, num_kv_heads_repeat: int = 1) -> nn.Module:
+        """
+        Replicates KV heads in attention modules based on provided multiplier.
+
+        Args:
+            model: The model to apply the transform to.
+            num_kv_heads_repeat: The number of times to repeat the KV heads.
+        """
+        transformed = False
+        if num_kv_heads_repeat is not None and num_kv_heads_repeat > 1:
+            text_model = cls._get_text_model(model)
+
+            orig_kv_heads = 1  # for mla #text_model.config.num_key_value_heads
+            new_kv_heads = num_kv_heads_repeat * orig_kv_heads
+            text_model.config.orig_kv_heads = orig_kv_heads
+            text_model.config.num_key_value_heads = new_kv_heads
+
+            hidden_size = text_model.config.hidden_size
+
+            logger.warning(f"Original KV heads: {orig_kv_heads}")
+            logger.warning(f"Modified KV heads: {new_kv_heads}")
+            transformed = True
+            for block in text_model.layers:
+                attn = getattr(block, "cross_attn", getattr(block, "self_attn", None))
+                attn.num_key_value_heads = new_kv_heads
+                head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+
+                cls._duplicate_weights_for_linear_layer(
+                    attn.kv_a_proj_with_mqa, orig_kv_heads, num_kv_heads_repeat, head_dim, hidden_size
+                )
+        return model, transformed
 
 
 class SpDTransform:
@@ -732,7 +1088,7 @@ class SpDTransform:
             supported_spd_model_types := [SPD_TARGET] + list(model_type_registry.keys())
         ):
             raise ValueError(
-                f"Specualtive model type {speculative_model_type} is not supported. we currently only support {supported_spd_model_types}"
+                f"Speculative model type {speculative_model_type} is not supported. we currently only support {supported_spd_model_types}"
             )
         elif (model_class := model.__class__) in cls._module_mapping:
             model.forward = MethodType(tlm_forward, model)
@@ -786,6 +1142,7 @@ class SamplerTransform:
         QEffPhi3ForCausalLM,
         QEffQwen2ForCausalLM,
         QEffQwen_2_5_vl_DecoderWrapper,
+        QEffQwen3ForCausalLM,
     }
 
     @classmethod
@@ -819,6 +1176,7 @@ class VlmNoKVOffloadTransform(ModuleMappingTransform):
 
 
 class KVCacheExternalModuleMapperTransform(ExternalModuleMapperTransform):
+    _match_class_replace_method = {}
     _match_string_replace_method = {
         "InternVLChatModel": {
             "forward": QEffInternVLModel.forward,
@@ -874,9 +1232,56 @@ class KVCacheExternalModuleMapperTransform(ExternalModuleMapperTransform):
         "RMSNorm": {
             "forward": QEFFGrok1CustomRMSNormAIC.forward,
         },
+        "DeepseekV3ForCausalLM": {
+            "forward": QEffDeepseekV3ForCausalLM.forward,
+            "get_submodules_for_export": QEffDeepseekV3ForCausalLM.get_submodules_for_export,
+            "get_dummy_pkv_cache": QEffDeepseekV3ForCausalLM.get_dummy_pkv_cache,
+        },
+        "DeepseekV3Model": {"forward": QEffDeepseekV3Model.forward, "__qeff_init__": QEffDeepseekV3Model.__qeff_init__},
+        "DeepseekV3DecoderLayer": {
+            "forward": QEffDeepseekV3DecoderLayer.forward,
+        },
+        "DeepseekV3MoE": {
+            "forward": QEffDeepseekV3MoE.forward,
+            "moe": QEffDeepseekV3MoE.moe,
+            "__qeff_init__": QEffDeepseekV3MoE.__qeff_init__,
+        },
+        "DeepseekV3Attention": {
+            "forward": QEffDeepseekV3Attention.forward,
+            "forward_full_kv": QEffDeepseekV3Attention.forward_full_kv,
+            "forward_full_kv_h_blocking": QEffDeepseekV3Attention.forward_full_kv_h_blocking,
+            "fused_forward": QEffDeepseekV3Attention.fused_forward,
+            "fused_forward_h_blocking": QEffDeepseekV3Attention.fused_forward_h_blocking,
+            "fused_forward_kv_blocking": QEffDeepseekV3Attention.fused_forward_kv_blocking,
+            "fused_forward_orig": QEffDeepseekV3Attention.fused_forward_orig,
+            "__qeff_init__": QEffDeepseekV3Attention.__qeff_init__,
+        },
+        "DeepseekV3RMSNorm": {
+            "forward": QEffDeepseekV3CustomRMSNormAIC.forward,
+        },
     }
 
+
+class PrefillOnlyExternalModuleMapperTransform(ExternalModuleMapperTransform):
     _match_class_replace_method = {}
+    _match_string_replace_method = {
+        "DeepseekV3MoE": {
+            "forward": QEffPrefillOnlyDeepseekV3MoE.forward,
+            "moe": QEffPrefillOnlyDeepseekV3MoE.moe,
+            "__qeff_init__": QEffPrefillOnlyDeepseekV3MoE.__qeff_init__,
+        },
+    }
+
+
+class RevertPrefillOnlyExternalModuleMapperTransform(ExternalModuleMapperTransform):
+    _match_class_replace_method = {}
+    _match_string_replace_method = {
+        "DeepseekV3MoE": {
+            "forward": QEffDeepseekV3MoE.forward,
+            "moe": QEffDeepseekV3MoE.moe,
+            "__qeff_init__": QEffDeepseekV3MoE.__qeff_init__,
+        },
+    }
 
 
 class T5ModelTransform(ModuleMappingTransform):
@@ -884,6 +1289,7 @@ class T5ModelTransform(ModuleMappingTransform):
     _module_mapping = {
         T5Attention: QEffT5Attention,
         T5LayerNorm: QEffT5LayerNorm,
+        T5Stack: QEffT5Stack,
     }
 
 
@@ -914,21 +1320,52 @@ class PoolingTransform:
         return model, transformed
 
 
-class BlockedKVAttentionTransform:
-    _module_mapping = {
-        QEffLlamaAttention,
-        QEffQwen2_5_VLAttention,
-    }
+def get_decoder_layer_classes_for_export(model: nn.Module) -> set:
+    """
+    Dynamically determine which DecoderLayer classes should be exported as functions
+    based on the model's architecture using the existing KVCacheTransform mapping.
+    """
+    # Define patterns that identify decoder layer classes
+    DECODER_LAYER_PATTERNS = ["DecoderLayer", "Block", "Layer"]
+
+    # Get all QEff classes that are decoder layers from the existing mapping
+    decoder_layer_classes = set()
+
+    for original_class, qeff_class in KVCacheTransform._module_mapping.items():
+        # Check if the QEff class name contains decoder layer patterns
+        qeff_class_name = qeff_class.__name__
+        if any(pattern in qeff_class_name for pattern in DECODER_LAYER_PATTERNS):
+            decoder_layer_classes.add(qeff_class)
+
+    # Filter to only include classes that are actually used in the current model
+    model_decoder_classes = set()
+    for module in model.modules():
+        if module.__class__ in decoder_layer_classes:
+            model_decoder_classes.add(module.__class__)
+
+    return model_decoder_classes
+
+
+class BlockingAttentionTransform:
+    _skip_classes = {}
 
     @classmethod
-    def apply(cls, model: nn.Module, num_kv_blocks) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, attn_blocking_config) -> Tuple[nn.Module, bool]:
         transformed = False
+        model_config = getattr(model, "config", None) or getattr(getattr(model, "model", None), "config", None)
+        model_architectures = getattr(model_config, "architectures", None) or []
+        supported_attention_classes = {
+            qeff_class
+            for qeff_class in KVCacheTransform._module_mapping.values()
+            if qeff_class.__name__.endswith("Attention")
+        }
         for module in model.modules():
-            if type(module) in cls._module_mapping:
-                repl_module = type(module)
-                module.__class__ = repl_module
-                module.forward = MethodType(partial(repl_module.forward, num_kv_blocks=num_kv_blocks), module)
-                transformed = True  # Set to True if at least one transformation occurs
-            elif module.__class__.__name__.endswith("Attention") and type(module) not in cls._module_mapping:
-                warnings.warn(f"KV blocking is not yet supported for {type(module)}.")
+            if type(module) in cls._skip_classes:
+                warnings.warn(f"Blocking is not yet supported for {type(module)}.")
+                continue
+            if type(module) in supported_attention_classes or "DeepseekV3ForCausalLM" in model_architectures:
+                module.attn_blocking_config = attn_blocking_config
+                transformed = True
+            elif module.__class__.__name__.endswith("Attention") and type(module) not in supported_attention_classes:
+                warnings.warn(f"Blocking is not yet supported for {type(module)}.")
         return model, transformed

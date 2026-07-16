@@ -6,12 +6,12 @@
 # -----------------------------------------------------------------------------
 
 import math
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from qwen_vl_utils import smart_resize
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import (
@@ -26,11 +26,17 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLRotaryEmbedding,
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
-    apply_rotary_pos_emb_vision,
+    Qwen2_5_VLVisionBlock,
     repeat_kv,
     rotate_half,
 )
 
+from QEfficient.blocking.attention_blocking import (
+    AttentionBlockingConfig,
+    BlockingMode,
+    generic_blocked_attention_interface,
+    past_key_value_update,
+)
 from QEfficient.transformers.cache_utils import QEffDynamicCache
 
 # from transformers import Qw
@@ -41,7 +47,15 @@ from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 from QEfficient.utils.logging_utils import logger
 
 
-def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section, unsqueeze_dim=1):
+def qeff_prepare_mrope_cos_sin(cos, sin, position_ids):
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    cos = torch.cat([cos[0, ..., 0:32], cos[1, ..., 32:80], cos[2, ..., 80:128]], dim=-1).unsqueeze(1)
+    sin = torch.cat([sin[0, ..., 0:32], sin[1, ..., 32:80], sin[2, ..., 80:128]], dim=-1).unsqueeze(1)
+    return cos, sin
+
+
+def qeff_apply_rotary_pos_emb(q, k, cos, sin):
     """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
 
     Explanation:
@@ -58,31 +72,61 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section, unsqu
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        mrope_section(`List(int)`):
-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-
-    cos = cos[position_ids]
-    sin = sin[position_ids]
-    cos = torch.cat([cos[0, ..., 0:32], cos[1, ..., 32:80], cos[2, ..., 80:128]], dim=-1).unsqueeze(unsqueeze_dim)
-    sin = torch.cat([sin[0, ..., 0:32], sin[1, ..., 32:80], sin[2, ..., 80:128]], dim=-1).unsqueeze(unsqueeze_dim)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
     return q_embed.to(q.dtype), k_embed.to(k.dtype)
+
+
+def qeff_apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
+
+
+class QEffQwen2_5_VLAttentionMask(nn.Module):
+    """Builds the windowed attention mask used by the vision blocks.
+
+    The mask is computed once per cu_seqlens outside of the VisionBlock loop
+    and reused across every block that shares that cu_seqlens value. The output
+    always has shape (1, seq_len, seq_len) and is passed to VisionAttention.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        seq_len = hidden_states.shape[0]
+        dtype = hidden_states.dtype
+        min_val = torch.finfo(dtype).min
+
+        # Create index grids
+        rows = torch.arange(seq_len).view(1, -1)
+        cols = torch.arange(seq_len).view(-1, 1)
+
+        # Prepare start and end indices
+        start = cu_seqlens[:-1].view(-1, 1, 1)
+        end = cu_seqlens[1:].view(-1, 1, 1)
+
+        # Create block masks using broadcasting
+        row_mask = (rows >= start) & (rows < end)
+        col_mask = (cols >= start) & (cols < end)
+        block_mask = row_mask & col_mask
+
+        # Combine all blocks into one mask
+        final_mask = torch.ones((seq_len, seq_len), dtype=dtype)
+        final_mask[block_mask.any(dim=0)] = 0
+        final_mask = torch.where(final_mask == 1.0, min_val, final_mask)
+
+        return final_mask.unsqueeze(0)
 
 
 class QEffQwen2_5_VLVisionAttention(Qwen2_5_VLVisionAttention):
@@ -96,7 +140,7 @@ class QEffQwen2_5_VLVisionAttention(Qwen2_5_VLVisionAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        attention_mask: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -114,33 +158,7 @@ class QEffQwen2_5_VLVisionAttention(Qwen2_5_VLVisionAttention):
             sin = emb.sin()
         else:
             cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        attention_mask = torch.full(
-            [1, seq_length, seq_length], torch.finfo(q.dtype).min, device=q.device, dtype=q.dtype
-        )
-
-        # Create index grids
-        seq_len = attention_mask.shape[-1]
-        rows = torch.arange(seq_len).view(1, -1)
-        cols = torch.arange(seq_len).view(-1, 1)
-
-        # Prepare start and end indices
-        start = cu_seqlens[:-1].view(-1, 1, 1)
-        end = cu_seqlens[1:].view(-1, 1, 1)
-
-        # Create block masks using broadcasting
-        row_mask = (rows >= start) & (rows < end)
-        col_mask = (cols >= start) & (cols < end)
-        block_mask = row_mask & col_mask  # shape: (num_blocks, seq_len, seq_len)
-
-        # Combine all blocks into one mask
-        final_mask = torch.ones((seq_len, seq_len), dtype=torch.float32)
-        final_mask[block_mask.any(dim=0)] = 0
-
-        final_mask = torch.where(final_mask == 1.0, torch.finfo(q.dtype).min, final_mask)
-
-        attention_mask[0] = final_mask
+        q, k = qeff_apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
@@ -155,7 +173,30 @@ class QEffQwen2_5_VLVisionAttention(Qwen2_5_VLVisionAttention):
         return attn_output
 
 
+class QEffQwen2_5_VLVisionBlock(Qwen2_5_VLVisionBlock):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+
 class QEffQwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
+    def __qeff_init__(self):
+        self.attention_mask_builder = QEffQwen2_5_VLAttentionMask()
+
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
 
@@ -290,7 +331,7 @@ class QEffQwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VisionTransformerPret
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (emb.cos().unsqueeze(-2).float(), emb.sin().unsqueeze(-2).float())
 
         bs, t, h, w = grid_thw.shape
 
@@ -309,13 +350,20 @@ class QEffQwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VisionTransformerPret
 
         cu_seqlens = torch.cat([torch.tensor([0], dtype=cu_seqlens.dtype), cu_seqlens])
 
+        full_attention_mask = self.attention_mask_builder(hidden_states, cu_seqlens)
+        window_attention_mask = self.attention_mask_builder(hidden_states, cu_window_seqlens)
+
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
-                cu_seqlens_now = cu_seqlens
+                attention_mask_now = full_attention_mask
             else:
-                cu_seqlens_now = cu_window_seqlens
+                attention_mask_now = window_attention_mask
 
-            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings)
+            hidden_states = blk(
+                hidden_states,
+                attention_mask=attention_mask_now,
+                position_embeddings=position_embeddings,
+            )
 
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
@@ -349,203 +397,35 @@ class QEffQwen2_5_VLRotaryEmbedding(Qwen2_5_VLRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 
-def eager_attention_forward_blockedKV(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    num_kv_blocks: Optional[torch.Tensor] = None,
-    cache_kwargs: Optional[Dict[str, Any]] = None,
-    layer_idx: int = None,
-    past_key_value: Optional[Cache] = None,
-    **kwargs,
-):
-    # Initialize result tensor
-    output = torch.zeros_like(query)
-
-    # Initialize Running Maximum
-    batch_size, num_heads, seq_len, _ = query.shape
-    current_max = torch.full((batch_size, num_heads, seq_len), float(MIN_MASKED_ATTENTION_VALUE))
-
-    # Initialize Denominator
-    current_denominator = torch.zeros(batch_size, num_heads, seq_len)
-
-    past_seen_tokens = cache_kwargs.get("past_seen_tokens")
-    position_ids = cache_kwargs.get("position_ids")
-    block_size = -(-past_seen_tokens // num_kv_blocks)
-    masked_tensor = torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32)
-
-    for j in range(num_kv_blocks):
-        start_index = j * block_size
-        end_index = (j + 1) * block_size
-        K_block, V_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
-        K_block_states = repeat_kv(K_block, module.num_key_value_groups)
-        V_block_states = repeat_kv(V_block, module.num_key_value_groups)
-        past_seen_tokens_start = start_index
-        past_seen_tokens_end = torch.where(
-            torch.tensor(past_seen_tokens, dtype=torch.int) < torch.tensor(end_index, dtype=torch.int),
-            past_seen_tokens,
-            end_index,
-        )
-        causal_mask_block = _create_causal_mask(
-            position_ids=position_ids, target_length=past_seen_tokens_end, start_index=past_seen_tokens_start
-        )
-
-        # Compute attention scores for the block
-        attn_weights_block = torch.matmul(query, K_block_states.transpose(2, 3)) / math.sqrt(module.head_dim)
-        if attention_mask is not None:
-            attn_weights_block = torch.where(causal_mask_block, masked_tensor, attn_weights_block)
-
-        # Update Running row maximum
-        prev_max = current_max
-        current_max = torch.max(prev_max, attn_weights_block.max(dim=-1).values)
-        delta_max = prev_max - current_max
-
-        current_exp = torch.exp(
-            attn_weights_block - current_max.unsqueeze(-1)
-        )  # Subract current_max from each column of attn_weights_block
-
-        # update running denominator
-        prev_denominator = current_denominator
-        current_denominator = prev_denominator * torch.exp(delta_max) + current_exp.sum(axis=-1)
-
-        prob = current_exp / current_denominator.unsqueeze(-1)
-
-        prev_output = output
-        output = ((prev_denominator / current_denominator).unsqueeze(-1)) * prev_output * torch.exp(
-            delta_max.unsqueeze(-1)
-        ) + torch.matmul(prob, V_block_states)
-    attn_output = output.transpose(1, 2).contiguous()
-    attn_weights = None
-
-    return attn_output, attn_weights
-
-
-def eager_attention_forward_q_blocked(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    **kwargs,
-):
-    """
-    Q-blocked attention for Qwen2.5-VL.
-    Blocks only the query SL dimension.
-
-    Args:
-        query: (BS, NH, Q_LEN, DH)
-        key: (BS, NH_KV, KV_LEN, DH)
-        value: (BS, NH_KV, KV_LEN, DH)
-        attention_mask: (BS, NH, Q_LEN, KV_LEN) or broadcastable
-    """
-    BS, NH, Q_LEN, DH = query.shape
-    _, _, KV_LEN, _ = key.shape
-
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    target_blocks_q = int(os.environ.get("num_q_blocks", Q_LEN))
-    q_block_positions = [(i * Q_LEN) // target_blocks_q for i in range(target_blocks_q)]
-    scaling = 1.0 / math.sqrt(module.head_dim)
-
-    q_output_blocks = []
-    q_attn_weights_blocks = []
-
-    # Process each Q block
-    for q_block_idx in range(target_blocks_q):
-        qi = q_block_positions[q_block_idx]
-
-        # Calculate Q block size
-        if q_block_idx == target_blocks_q - 1:
-            real_q_len = Q_LEN - qi
-        else:
-            real_q_len = q_block_positions[q_block_idx + 1] - qi
-
-        # Extract Q block
-        q_block = query[:, :, qi : qi + real_q_len, :]
-        attn_mask_block = None
-        if attention_mask is not None:
-            attn_mask_block = attention_mask[:, :, qi : qi + real_q_len, :]
-
-        # Compute attention scores for this Q block
-        attn_weights = torch.matmul(q_block, key_states.transpose(2, 3)) * scaling
-        if attn_mask_block is not None:
-            attn_weights = torch.where(
-                attn_mask_block,
-                torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32, device=attn_weights.device),
-                attn_weights,
-            )
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-
-        # Compute output for this Q block
-        output_block = torch.matmul(attn_weights, value_states)
-
-        q_output_blocks.append(output_block)
-        q_attn_weights_blocks.append(attn_weights)
-
-    attn_output = torch.cat(q_output_blocks, dim=2)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    # Concatenate attention weights
-    attn_weights = torch.cat(q_attn_weights_blocks, dim=2)
-
-    return attn_output, attn_weights
-
-
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
-    num_kv_blocks: Optional[torch.Tensor] = None,
     cache_kwargs: Optional[Dict[str, Any]] = None,
     layer_idx: int = None,
     past_key_value: Optional[Cache] = None,
     **kwargs,
 ):
     """
-    Wrapper that routes to blocked or default attention based on environment variable.
+    default attention
     """
-    blocking_mode = os.environ.get("ATTENTION_BLOCKING_MODE", "default").lower()
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
 
-    if blocking_mode == "q":
-        return eager_attention_forward_q_blocked(module, query, key, value, attention_mask, **kwargs)
-    elif blocking_mode != "q" and num_kv_blocks is not None:
-        return eager_attention_forward_blockedKV(
-            module,
-            query,
-            key,
-            value,
-            attention_mask,
-            cache_kwargs=cache_kwargs,
-            num_kv_blocks=num_kv_blocks,
-            layer_idx=layer_idx,
-            past_key_value=past_key_value,
-            **kwargs,
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) / math.sqrt(module.head_dim)
+
+    if attention_mask is not None:
+        attn_weights = torch.where(
+            attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=module.config.torch_dtype), attn_weights
         )
-    elif blocking_mode == "default":
-        # Original implementation
-        key_states = repeat_kv(key, module.num_key_value_groups)
-        value_states = repeat_kv(value, module.num_key_value_groups)
 
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) / math.sqrt(module.head_dim)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
 
-        if attention_mask is not None:
-            attn_weights = torch.where(
-                attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
-            )
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        return attn_output, attn_weights
-    else:
-        raise ValueError(f"Invalid ATTENTION_BLOCKING_MODE: {blocking_mode}. Must be 'q' or 'default'")
+    return attn_output, attn_weights
 
 
 class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
@@ -559,7 +439,7 @@ class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
@@ -581,50 +461,49 @@ class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
         # kv_seq_len = key_states.shape[-2]
-        # kv_seq_len = past_key_value.get_seq_length(self.layer_idx, cache_position)
-        past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+        past_seen_tokens = past_key_values.get_seq_length(self.layer_idx) if past_key_values is not None else 0
 
-        query_states, key_states = qeff_apply_rotary_pos_emb(
-            query_states, key_states, cos_cached, sin_cached, position_ids[1:], self.rope_scaling["mrope_section"]
-        )
+        query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos_cached, sin_cached)
 
-        if past_key_value is not None:
-            if num_kv_blocks is not None:
-                cache_kwargs = {
-                    "sin": sin_cached,
-                    "cos": cos_cached,
-                    "batch_index": batch_index,
-                    "position_ids": position_ids[0],
-                    "past_seen_tokens": past_seen_tokens,
-                }
-                past_key_value.write_only(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
-                # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                cache_kwargs = {
-                    "sin": sin_cached,
-                    "cos": cos_cached,
-                    "batch_index": batch_index,
-                    "position_ids": position_ids[0],
-                }
-                if comp_ctx_lengths is not None:
-                    attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
-                    cache_kwargs["CCL"] = attention_mask.shape[-1]
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            num_kv_blocks=num_kv_blocks,
-            cache_kwargs=cache_kwargs,
-            layer_idx=self.layer_idx,
-            past_key_value=past_key_value,
-            **kwargs,
-        )
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
+        use_blocking = blocking_config is not None and (blocking_config.mode != BlockingMode.NONE)
+        if use_blocking:
+            attn_output, attn_weights = generic_blocked_attention_interface(
+                module=self,
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
+                scaling=self.scaling,
+                layer_idx=self.layer_idx,
+                past_key_value=past_key_values,
+                blocking_config=blocking_config,
+                comp_ctx_length=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids[0],
+                past_seen_tokens=past_seen_tokens,
+            )
+        else:
+            key_states, value_states, attention_mask, _ = past_key_value_update(
+                module=self,
+                key=key_states,
+                value=value_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_values,
+                comp_ctx_lengths=comp_ctx_lengths,
+                batch_index=batch_index,
+                position_ids=position_ids[0],
+            )
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
@@ -633,7 +512,7 @@ class QEffQwen2_5_VLAttention(Qwen2_5_VLAttention):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values
 
 
 class QEffQwen2_5_VLDecoderLayer(Qwen2_5_VLDecoderLayer):
@@ -684,7 +563,7 @@ class QEffQwen2_5_VLDecoderLayer(Qwen2_5_VLDecoderLayer):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_value,
             comp_ctx_lengths=comp_ctx_lengths,
             batch_index=batch_index,
             output_attentions=output_attentions,
@@ -766,6 +645,7 @@ class QEffQwen2_5_VLTextModel(Qwen2_5_VLTextModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        cos, sin = qeff_prepare_mrope_cos_sin(self.cos_cached, self.sin_cached, position_ids[1:])
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -781,8 +661,8 @@ class QEffQwen2_5_VLTextModel(Qwen2_5_VLTextModel):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
+                sin_cached=sin,
+                cos_cached=cos,
                 **kwargs,
             )
 
@@ -865,7 +745,7 @@ class QEffQwen2_5_VLModel(Qwen2_5_VLModel):
 class QEffQwen_2_5_vl_EncoderWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = model
+        self.model = model.model
         self.model.vision_model = self.model.visual
 
     def get_submodules_for_export(self) -> Type[nn.Module]:
@@ -932,6 +812,7 @@ class QEffQwen_2_5_vl_DecoderWrapper(nn.Module):
         logit_index = position_ids[0].to(torch.int32).argmax(1, keepdim=True)
         hidden_states = outputs.last_hidden_state[torch.arange(position_ids[0].shape[0]).view(-1, 1), logit_index]
         logits = self.model.lm_head(hidden_states)
+        logits = logits.float()
         image_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
 
         return logits, vision_embeds, image_idx, outputs.past_key_values
@@ -951,20 +832,24 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         continuous_batching: bool = False,
         **kwargs,
     ):
+        prefill_seq_len = kwargs.get("prefill_seq_len", constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+        if prefill_seq_len is None:
+            prefill_seq_len = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
+        prefill_seq_len = int(prefill_seq_len)
         inputs_shapes = {}
-        inputs_shapes["input_ids"] = (constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+        inputs_shapes["input_ids"] = (constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, prefill_seq_len)
 
         vision_size = 3577
         inputs_shapes["vision_embeds"] = (
             constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
             vision_size,
-            self.model.config.hidden_size,
+            self.model.config.text_config.hidden_size,
         )
         inputs_shapes["image_grid_thw"] = (1, 1, 98, 146)
         inputs_shapes["position_ids"] = (
             3,
             constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
-            constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN,
+            prefill_seq_len,
         )
         inputs_shapes["pixel_values"] = (14308, 1176)
         inputs_shapes["image_idx"] = (1, 1)
@@ -972,14 +857,14 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         # Define inputs
         vision_inputs = {}
         lang_inputs = {}
-        vision_inputs["pixel_values"] = torch.zeros((inputs_shapes["pixel_values"]), dtype=torch.float32)
+        vision_inputs["pixel_values"] = torch.zeros((inputs_shapes["pixel_values"]), dtype=self.config.torch_dtype)
         vision_inputs["image_grid_thw"] = torch.zeros((inputs_shapes["image_grid_thw"]), dtype=torch.int64)
         lang_inputs["input_ids"] = torch.zeros((inputs_shapes["input_ids"]), dtype=torch.int64)
-        lang_inputs["vision_embeds"] = torch.zeros((inputs_shapes["vision_embeds"]), dtype=torch.float32)
+        lang_inputs["vision_embeds"] = torch.zeros((inputs_shapes["vision_embeds"]), dtype=self.config.torch_dtype)
         lang_inputs["position_ids"] = (
             (
-                torch.arange(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, dtype=torch.int64)
-                .view(1, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+                torch.arange(prefill_seq_len, dtype=torch.int64)
+                .view(1, prefill_seq_len)
                 .repeat(constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, 1)
             )
             .unsqueeze(0)
@@ -994,19 +879,19 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         kv_cache_shape = get_padding_shape_from_config(
             config=self.model.config.text_config,
             batch_size=fbs if continuous_batching else bs,
-            seq_len=constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN,
+            seq_len=prefill_seq_len,
         )
 
         lang_inputs["past_key_values"] = [[] for _ in range(self.model.config.text_config.num_hidden_layers)]
         for i in range(self.model.config.text_config.num_hidden_layers):
             for kv in ["key", "value"]:
-                lang_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
+                lang_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=self.config.torch_dtype))
 
         if continuous_batching:
             lang_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
 
         if comp_ctx_lengths is not None:
-            lang_inputs["comp_ctx_lengths"] = torch.randint(0, 100, (40,), dtype=torch.int8)
+            lang_inputs["comp_ctx_lengths"] = torch.randint(0, 100, (40,), dtype=torch.int64)
 
         inputs = {}
         if kv_offload:
@@ -1023,10 +908,10 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         batch_size: int,
         prefill_seq_len: int,
         ctx_len: int,
-        img_size: None,
-        height: int = None,
-        width: int = None,
-        num_frames: int = 1,
+        height: int | List[int] = None,
+        width: int | List[int] = None,
+        img_size=None,
+        num_frames: int | List[int] = 1,
         kv_offload: bool = False,
         continuous_batching: bool = False,
         kv_cache_batch_size: Optional[int] = None,
@@ -1042,80 +927,70 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             logger.warning(
                 f"Setting height and width to be {height} and {width} respectively, as it was neither passed nor found in vision_config"
             )
+        height = [height] if isinstance(height, int) else height
+        width = [width] if isinstance(width, int) else width
+        num_frames = [num_frames] * len(height) if isinstance(num_frames, int) else num_frames
+
         prefill_seq_len = prefill_seq_len if prefill_seq_len else 128
         ctx_len = ctx_len if ctx_len else constants.INTERN_CTX_LEN
         channel = 3
         patch_size = self.config.vision_config.patch_size
         temporal_patch_size = self.config.vision_config.temporal_patch_size
 
-        IMAGE_FACTOR = 28
-        MIN_PIXELS = 4 * 28 * 28
-        MAX_PIXELS = 16384 * 28 * 28
-        MAX_RATIO = 200
+        IMAGE_FACTOR = constants.IMAGE_FACTOR_QWEN_2_5
+        IMAGE_MIN_TOKEN_NUM = constants.IMAGE_MIN_TOKEN_NUM
+        IMAGE_MAX_TOKEN_NUM = constants.IMAGE_MAX_TOKEN_NUM
+        min_pixels = IMAGE_MIN_TOKEN_NUM * IMAGE_FACTOR**2
+        max_pixels = IMAGE_MAX_TOKEN_NUM * IMAGE_FACTOR**2
+        mm_processor_kwargs = compiler_options.pop("mm_processor_kwargs", None)
+        if mm_processor_kwargs:
+            min_pixels = mm_processor_kwargs.get("min_pixels", min_pixels)
+            max_pixels = mm_processor_kwargs.get("max_pixels", max_pixels)
 
-        def round_by_factor(number: int, factor: int) -> int:
-            """Returns the closest integer to 'number' that is divisible by 'factor'."""
-            return round(number / factor) * factor
+        vision = []
+        max_vision_size = 0
+        user_vision_size = compiler_options.pop("vision_size", None)
+        if user_vision_size:
+            assert user_vision_size < ctx_len, "vision_size must be less than ctx_len"
+            max_vision_size = user_vision_size
 
-        def ceil_by_factor(number: int, factor: int) -> int:
-            """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
-            return math.ceil(number / factor) * factor
-
-        def floor_by_factor(number: int, factor: int) -> int:
-            """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
-            return math.floor(number / factor) * factor
-
-        def smart_resize(
-            height: int,
-            width: int,
-            factor: int = IMAGE_FACTOR,
-            min_pixels: int = MIN_PIXELS,
-            max_pixels: int = MAX_PIXELS,
-        ) -> tuple[int, int]:
-            """
-            Rescales the image so that the following conditions are met:
-
-            1. Both dimensions (height and width) are divisible by 'factor'.
-
-            2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
-
-            3. The aspect ratio of the image is maintained as closely as possible.
-            """
-            if max(height, width) / min(height, width) > MAX_RATIO:
-                raise ValueError(
-                    f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
+        for h, w, f in zip(height, width, num_frames):
+            resized_height, resized_width = smart_resize(
+                height=h, width=w, factor=IMAGE_FACTOR, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+            grid_h, grid_w = resized_height // patch_size, resized_width // patch_size
+            grid_height = grid_h * grid_w
+            grid_width = patch_size * patch_size * temporal_patch_size * channel
+            vision_size = grid_height // 4
+            grid_height = grid_height * batch_size
+            if not user_vision_size:
+                max_vision_size = max(max_vision_size, vision_size * f)
+                assert max_vision_size < ctx_len, (
+                    f"Computed vision_size of {vision_size * f} tokens "
+                    f"(vision_size={vision_size}, num_frames={f}) for image resolution "
+                    f"(width={w}, height={h}) must be less than ctx_len. Please adjust the image "
+                    "resolution."
                 )
-            h_bar = max(factor, round_by_factor(height, factor))
-            w_bar = max(factor, round_by_factor(width, factor))
-            if h_bar * w_bar > max_pixels:
-                beta = math.sqrt((height * width) / max_pixels)
-                h_bar = floor_by_factor(height / beta, factor)
-                w_bar = floor_by_factor(width / beta, factor)
-            elif h_bar * w_bar < min_pixels:
-                beta = math.sqrt(min_pixels / (height * width))
-                h_bar = ceil_by_factor(height * beta, factor)
-                w_bar = ceil_by_factor(width * beta, factor)
-            return h_bar, w_bar
+            else:
+                if vision_size * f > user_vision_size:
+                    logger.warning_once(
+                        f"Computed vision_size of {vision_size * f} tokens "
+                        f"(vision_size={vision_size}, num_frames={f}) for image resolution "
+                        f"(width={w}, height={h}) exceeds the provided "
+                        f"vision_size={user_vision_size}. "
+                        f"Vision embedding needs to be chunked during prefill."
+                    )
 
-        resized_height, resized_width = smart_resize(height=height, width=width)
-        grid_h, grid_w = resized_height // patch_size, resized_width // patch_size
-        grid_height = grid_h * grid_w
-        grid_width = patch_size * patch_size * temporal_patch_size * channel
-        vision_size = grid_height // 4
-        vision_size = vision_size * num_frames
-        grid_height = grid_height * batch_size
-
-        vision = [
-            {
-                "batch_size": batch_size,
-                "vision_size": vision_size,
-                "grid_height": grid_height,
-                "grid_width": grid_width,
-                "grid_h": grid_h,
-                "grid_w": grid_w,
-            }
-        ]
-
+            vision.append(
+                {
+                    "batch_size": batch_size,
+                    "vision_size": vision_size,
+                    "grid_height": grid_height,
+                    "grid_width": grid_width,
+                    "grid_h": grid_h,
+                    "grid_w": grid_w,
+                }
+            )
         if comp_ctx_lengths_prefill is not None:
             lang = []
 
@@ -1124,7 +999,7 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                     "batch_size": 1 if continuous_batching else batch_size,
                     "seq_len": prefill_seq_len,
                     "ctx_len": ctx_len,
-                    "vision_size": vision_size,
+                    "vision_size": max_vision_size,
                     "comp_ctx_lengths": comp_ctx_lengths_prefill[i],
                     "vision_batch_size": batch_size,
                 }
@@ -1143,7 +1018,7 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                     "batch_size": full_batch_size if continuous_batching else batch_size,
                     "seq_len": "1",
                     "ctx_len": ctx_len,
-                    "vision_size": vision_size,
+                    "vision_size": max_vision_size,
                     "comp_ctx_lengths": comp_ctx_lengths_decode[i],
                     "vision_batch_size": batch_size,
                 }
@@ -1159,7 +1034,7 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 "batch_size": 1 if continuous_batching else batch_size,
                 "seq_len": prefill_seq_len,
                 "ctx_len": ctx_len,
-                "vision_size": vision_size,
+                "vision_size": max_vision_size,
                 "vision_batch_size": batch_size,
             }
 
@@ -1174,7 +1049,7 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 "batch_size": full_batch_size if continuous_batching else batch_size,
                 "seq_len": 1,
                 "ctx_len": ctx_len,
-                "vision_size": vision_size,
+                "vision_size": max_vision_size,
                 "vision_batch_size": batch_size,
             }
 
@@ -1263,13 +1138,22 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
 
         inputs["position_ids"] = torch.arange(input_ids_length).view(1, 1, input_ids_length).expand(-1, batch_size, -1)
 
+        mm_token_type_ids = inputs.get("mm_token_type_ids")
+        if mm_token_type_ids is None:
+            # transformers>=5.5 get_rope_index expects modality token types (text=0, image=1, video=2).
+            mm_token_type_ids = torch.zeros_like(inputs["input_ids"], dtype=torch.int32)
+            mm_token_type_ids = mm_token_type_ids.masked_fill(inputs["input_ids"] == self.config.image_token_id, 1)
+            mm_token_type_ids = mm_token_type_ids.masked_fill(inputs["input_ids"] == self.config.video_token_id, 2)
+
         pos_ids, rope_deltas = self.model.get_rope_index(
-            inputs["input_ids"],
-            None if "image_grid_thw" not in inputs else inputs["image_grid_thw"],
-            video_grid_thw=None,
-            second_per_grid_ts=None,
+            input_ids=inputs["input_ids"],
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=None if "image_grid_thw" not in inputs else inputs["image_grid_thw"],
+            video_grid_thw=None if "video_grid_thw" not in inputs else inputs["video_grid_thw"],
+            second_per_grid_ts=None if "second_per_grid_ts" not in inputs else inputs["second_per_grid_ts"],
             attention_mask=inputs["attention_mask"],
         )
+        self.model.rope_deltas = rope_deltas
 
         inputs["position_ids"] = torch.cat((inputs["position_ids"], pos_ids), dim=0)
 
@@ -1288,5 +1172,9 @@ class QEffQwen_2_5_vl_ForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         return [
             IOInfo(name="input_ids", datatype=torch.int64, shape=("batch_size", "seq_len")),
             IOInfo(name="attention_mask", datatype=torch.int64, shape=("batch_size", "seq_len")),
-            IOInfo(name="pixel_values", datatype=torch.float32, shape=("batch_size", 3, "image_size", "image_size")),
+            IOInfo(
+                name="pixel_values",
+                datatype=self.config.torch_dtype,
+                shape=("batch_size", 3, "image_size", "image_size"),
+            ),
         ]

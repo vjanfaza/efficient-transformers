@@ -9,7 +9,6 @@ from typing import List
 import numpy as np
 import torch
 
-from QEfficient.transformers.modeling_utils import DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH
 from QEfficient.utils import (
     get_num_layers_from_config,
     get_padding_shape_from_config,
@@ -20,7 +19,9 @@ from QEfficient.utils import (
 
 
 class InputHandler:
-    def __init__(self, batch_size, tokenizer, config, prompt, prompt_len, ctx_len, full_batch_size):
+    def __init__(
+        self, batch_size, tokenizer, config, prompt, prompt_len, ctx_len, full_batch_size, dtype=torch.float32
+    ):
         """
         Initialization
 
@@ -41,6 +42,7 @@ class InputHandler:
         self.ctx_len = ctx_len
         self.full_batch_size = full_batch_size
         self.config = config
+        self.dtype = dtype
         self.n_layer = get_num_layers_from_config(config)
         self.padding_shape = get_padding_shape_from_config(
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
@@ -50,6 +52,43 @@ class InputHandler:
         self.global_shape, self.sliding_shape = get_sliding_window_shapes(
             config=config, batch_size=full_batch_size if full_batch_size else batch_size, seq_len=ctx_len
         )
+
+    def _get_layer_cache_shape(self, layer_idx):
+        if not hasattr(self.config, "layer_types") or self.config.layer_types is None:
+            if hasattr(self.config, "sliding_window") and hasattr(self.config, "sliding_window_pattern"):
+                is_sliding = bool((layer_idx + 1) % self.config.sliding_window_pattern)
+                if is_sliding:
+                    return self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
+            return self.padding_shape
+
+        head_dim = (
+            getattr(self.config, "head_dim", None)
+            or (
+                self.config.hidden_size // self.config.num_attention_heads
+                if getattr(self.config, "hidden_size", None) is not None
+                and getattr(self.config, "num_attention_heads", None) is not None
+                else None
+            )
+            or self.padding_shape[-1]
+        )
+
+        layer_type = self.config.layer_types[layer_idx]
+        if layer_type == "sliding_attention":
+            n_heads = self.config.num_key_value_heads
+            d_head = head_dim
+            ctx_len = min(self.config.sliding_window, self.ctx_len)
+        else:
+            use_alternative_attention = getattr(self.config, "attention_k_eq_v", False)
+            n_heads = (
+                self.config.num_global_key_value_heads
+                if use_alternative_attention and getattr(self.config, "num_global_key_value_heads", None) is not None
+                else self.config.num_key_value_heads
+            )
+            d_head = self.config.global_head_dim if getattr(self.config, "global_head_dim", None) else head_dim
+            ctx_len = self.ctx_len
+
+        batch = self.full_batch_size if self.full_batch_size else self.padding_shape[0]
+        return [batch, n_heads, ctx_len, d_head]
 
     def prepare_pytorch_inputs(self):
         """
@@ -93,15 +132,9 @@ class InputHandler:
 
         past_key_values = []
         for i in range(self.n_layer):
-            if (
-                all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
-                and self.config.layer_types[i] == "sliding_attention"
-            ):
-                pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
-            else:
-                pad_shape = self.padding_shape
-            past_key = torch.zeros((pad_shape), dtype=torch.float32)
-            past_value = torch.zeros((pad_shape), dtype=torch.float32)
+            pad_shape = self._get_layer_cache_shape(i)
+            past_key = torch.zeros((pad_shape), dtype=self.dtype)
+            past_value = torch.zeros((pad_shape), dtype=self.dtype)
             pkv = (past_key, past_value)
             past_key_values.append(pkv)
         inputs["past_key_values"] = tuple(past_key_values)
@@ -134,9 +167,16 @@ class InputHandler:
             updated_inputs["input_ids"] = pt_outputs["logits"].argmax(-1).reshape(-1, 1)
             updated_inputs["position_ids"] = inputs["position_ids"].max(1, keepdim=True).values + 1
 
-        updated_inputs["past_key_values"] = tuple(
-            [(key.detach(), value.detach()) for key, value in pt_outputs["past_key_values"]]
-        )
+        pkv = pt_outputs["past_key_values"]
+        if isinstance(pkv, (list, tuple)):
+            normalized_pkv = []
+            for layer_cache in pkv:
+                if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
+                    key, value = layer_cache[0], layer_cache[1]
+                    normalized_pkv.append((key.detach(), value.detach()))
+            updated_inputs["past_key_values"] = tuple(normalized_pkv)
+        else:
+            updated_inputs["past_key_values"] = pkv
 
         return updated_inputs
 
@@ -167,22 +207,10 @@ class InputHandler:
             axis=1,
         ).astype(np.int64)
 
-        if hasattr(self.config, "model_type") and self.config.model_type in DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH:
-            for i in range(self.n_layer):
-                cache_shape = self.global_shape if not self.is_chunked_attention[i] else self.sliding_shape
-                inputs["past_key." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
-                inputs["past_value." + str(i)] = np.zeros((cache_shape), dtype=np.float32)
-        else:
-            for i in range(self.n_layer):
-                if (
-                    all(hasattr(self.config, attr) for attr in ["sliding_window", "layer_types"])
-                    and self.config.layer_types[i] == "sliding_attention"
-                ):
-                    pad_shape = self.padding_shape[:2] + [self.config.sliding_window] + [self.padding_shape[-1]]
-                else:
-                    pad_shape = self.padding_shape
-                inputs["past_key." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
-                inputs["past_value." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
+        for i in range(self.n_layer):
+            pad_shape = self._get_layer_cache_shape(i)
+            inputs["past_key." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
+            inputs["past_value." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
         if self.full_batch_size:
             inputs["batch_index"] = np.arange(self.full_batch_size).reshape(-1, 1)
         return inputs
@@ -200,7 +228,7 @@ class InputHandler:
         """
 
         updated_inputs = {}
-        updated_inputs["input_ids"] = ort_outputs["logits"].argmax(-1)
+        updated_inputs["input_ids"] = ort_outputs["logits"][:, -1, :].argmax(-1).reshape(-1, 1)
         updated_inputs["position_ids"] = np.max(inputs["position_ids"], axis=1, keepdims=True) + 1
         for i in range(self.n_layer):
             updated_inputs["past_key." + str(i)] = ort_outputs["past_key_values"][i * 2]
@@ -236,7 +264,18 @@ class InputHandler:
 
 class InputHandlerVLM:
     def __init__(
-        self, batch_size, config, image, conversation, processor, prompt, prompt_len, ctx_len, max_gen_len, n_layer
+        self,
+        batch_size,
+        config,
+        image,
+        conversation,
+        processor,
+        prompt,
+        prompt_len,
+        ctx_len,
+        max_gen_len,
+        n_layer,
+        dtype=torch.float32,
     ):
         self.ctx_len = ctx_len
         self.prompt_len = prompt_len
@@ -248,6 +287,7 @@ class InputHandlerVLM:
         self.n_layer = n_layer
         self.processor = processor
         self.conversation = conversation
+        self.dtype = dtype
 
     def prepare_pytorch_inputs(self):
         """
@@ -281,15 +321,15 @@ class InputHandlerVLM:
                 assert idx == ((i - 3) // 5), f"{i}, {(i - 3) // 5}"
                 inputs["past_key_values"].append(
                     (
-                        torch.zeros(1, num_key_value_heads, image_tokens_len, head_dim),
-                        torch.zeros(1, num_key_value_heads, image_tokens_len, head_dim),
+                        torch.zeros((1, num_key_value_heads, image_tokens_len, head_dim), dtype=self.dtype),
+                        torch.zeros((1, num_key_value_heads, image_tokens_len, head_dim), dtype=self.dtype),
                     )
                 )
             else:
                 inputs["past_key_values"].append(
                     (
-                        torch.zeros(1, num_key_value_heads, self.ctx_len, head_dim),
-                        torch.zeros(1, num_key_value_heads, self.ctx_len, head_dim),
+                        torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
+                        torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
                     )
                 )
 
@@ -316,7 +356,9 @@ class InputHandlerVLM:
         inputs["image_idx"] = np.array([[0]])
 
         vision_inputs = {
-            k: v for k, v in inputs.items() if k in {"pixel_values", "aspect_ratio_ids", "aspect_ratio_mask"}
+            k: v
+            for k, v in inputs.items()
+            if k in {"pixel_values", "image_position_ids", "aspect_ratio_ids", "aspect_ratio_mask"}
         }
 
         for i in range(num_hidden_layers):
@@ -365,6 +407,9 @@ class InputHandlerVLM:
         outputs["image_features_RetainedState"] = (
             ort_outputs["image_features_RetainedState"] if "image_features_RetainedState" in ort_outputs else None
         )
+        outputs["vision_embeds_RetainedState"] = (
+            ort_outputs["vision_embeds_RetainedState"] if "vision_embeds_RetainedState" in ort_outputs else None
+        )
         outputs["image_idx"] = ort_outputs["image_idx_output"]
         return outputs
 
@@ -389,7 +434,12 @@ class InputHandlerVLM:
             updated_inputs["pixel_values"] = ort_outputs["pixel_values_RetainedState"]
         if "image_features_RetainedState" in ort_outputs.keys():
             updated_inputs["image_features"] = ort_outputs["image_features_RetainedState"]
-
+        if "vision_embeds_RetainedState" in ort_outputs.keys():
+            updated_inputs["vision_embeds"] = ort_outputs["vision_embeds_RetainedState"]
+        if "mm_token_type_ids" in inputs.keys():
+            updated_inputs["mm_token_type_ids"] = np.zeros_like(
+                updated_inputs["input_ids"], dtype=inputs["mm_token_type_ids"].dtype
+            )
         if "cross_attention_mask" in inputs.keys():
             bs, _, num_images, img_tiles = inputs["cross_attention_mask"].shape
             updated_inputs["cross_attention_mask"] = torch.ones(
@@ -403,7 +453,19 @@ class InputHandlerVLM:
 
 
 class InputHandlerInternVL(InputHandlerVLM):
-    def __init__(self, batch_size, config, image, processor, prompt, prompt_len, ctx_len, max_gen_len, n_layer):
+    def __init__(
+        self,
+        batch_size,
+        config,
+        image,
+        processor,
+        prompt,
+        prompt_len,
+        ctx_len,
+        max_gen_len,
+        n_layer,
+        dtype=torch.float32,
+    ):
         self.ctx_len = ctx_len
         self.prompt_len = prompt_len
         self.max_gen_len = max_gen_len
@@ -413,6 +475,7 @@ class InputHandlerInternVL(InputHandlerVLM):
         self.batch_size = batch_size
         self.n_layer = n_layer
         self.processor = processor
+        self.dtype = dtype
 
     def prepare_pytorch_inputs(self):
         question = "<image>\n" + self.prompt
@@ -438,8 +501,8 @@ class InputHandlerInternVL(InputHandlerVLM):
         for i in range(num_hidden_layers):
             inputs["past_key_values"].append(
                 (
-                    torch.zeros(1, num_key_value_heads, self.ctx_len, head_dim),
-                    torch.zeros(1, num_key_value_heads, self.ctx_len, head_dim),
+                    torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
+                    torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
                 )
             )
 

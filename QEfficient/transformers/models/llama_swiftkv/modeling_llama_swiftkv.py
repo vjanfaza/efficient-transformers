@@ -70,7 +70,7 @@ class QEffLlamaSwiftKVAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.is_causal = True
         self.layer_idx = layer_idx
         self.q_proj_swiftkv = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
@@ -86,7 +86,7 @@ class QEffLlamaSwiftKVAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         comp_ctx_lengths: Optional[torch.LongTensor] = None,
         attention_mask: torch.Tensor = None,
         batch_index: Optional[torch.LongTensor] = None,
@@ -98,9 +98,10 @@ class QEffLlamaSwiftKVAttention(nn.Module):
         query = self.q_proj_swiftkv(hidden_states)
         # Reshape the query, key, and value tensors.
         query_states = query.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        token_index = position_ids.to(torch.int32).argmax(1)
 
         cache_kwargs = {"position_ids": position_ids, "batch_index": batch_index}
-        if past_key_value is not None:
+        if past_key_values is not None:
             if self.layer_idx is None:
                 raise ValueError(
                     f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
@@ -111,12 +112,16 @@ class QEffLlamaSwiftKVAttention(nn.Module):
                 attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
                 cache_kwargs["CCL"] = attention_mask.shape[-1]
             # kv_seq_len = past_key_value.get_seq_length(self.layer_idx)
-        key_states, value_states = past_key_value.read_only(self.layer_idx, cache_kwargs=cache_kwargs)
+        key_states, value_states = past_key_values.read_only(self.layer_idx, cache_kwargs=cache_kwargs)
 
-        position_ids = position_ids[torch.arange(bsz), position_ids.to(torch.int32).argmax(1)].unsqueeze(1)
-        query_states, _ = qeff_apply_rotary_pos_emb(
-            query_states, torch.empty_like(query_states), cos_cached, sin_cached, position_ids
-        )
+        position_ids = position_ids[torch.arange(bsz), token_index].unsqueeze(1)
+        if cos_cached.dim() == 2:
+            cos = cos_cached[position_ids].unsqueeze(1)
+            sin = sin_cached[position_ids].unsqueeze(1)
+        else:
+            cos = cos_cached[torch.arange(bsz), :, token_index, :].unsqueeze(2)
+            sin = sin_cached[torch.arange(bsz), :, token_index, :].unsqueeze(2)
+        query_states, _ = qeff_apply_rotary_pos_emb(query_states, torch.empty_like(query_states), cos, sin)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -124,7 +129,9 @@ class QEffLlamaSwiftKVAttention(nn.Module):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:
             attn_weights = torch.where(
-                attention_mask, torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=torch.float32), attn_weights
+                attention_mask,
+                torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=self.k_proj_swiftkv.weight.dtype),
+                attn_weights,
             )
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -140,7 +147,7 @@ class QEffLlamaSwiftKVAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, past_key_value
+        return attn_output, past_key_values
 
 
 class QEffLlamaSwiftKVDecoderLayer(nn.Module):
@@ -177,7 +184,7 @@ class QEffLlamaSwiftKVDecoderLayer(nn.Module):
         hidden_states, past_key_values = self.self_attn(
             hidden_states=hidden_states,
             position_ids=position_ids,
-            past_key_value=past_key_values,
+            past_key_values=past_key_values,
             comp_ctx_lengths=comp_ctx_lengths,
             attention_mask=causal_mask,
             batch_index=batch_index,
@@ -230,6 +237,8 @@ class QEffLlamaSwiftKVModel(nn.Module):
         causal_mask,
         batch_index,
     ) -> torch.Tensor:
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+        cos = self.cos_cached[position_ids].unsqueeze(1)
         for layer_idx in range(self.config.num_key_value_layers, self.config.num_hidden_layers):
             layer = self.layers[layer_idx]
             hidden_states = layer(
@@ -239,8 +248,8 @@ class QEffLlamaSwiftKVModel(nn.Module):
                 comp_ctx_lengths,
                 causal_mask,
                 batch_index,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
+                sin_cached=sin,
+                cos_cached=cos,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -350,6 +359,8 @@ class QEffLlamaSwiftKVModel(nn.Module):
         )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+        cos = self.cos_cached[position_ids].unsqueeze(1)
 
         causal_mask = self._update_causal_mask(
             None, inputs_embeds, cache_position, position_ids, past_key_values, False
@@ -369,8 +380,8 @@ class QEffLlamaSwiftKVModel(nn.Module):
                 batch_index=batch_index,
                 output_attentions=False,
                 use_cache=True,
-                sin_cached=self.sin_cached,
-                cos_cached=self.cos_cached,
+                sin_cached=sin,
+                cos_cached=cos,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -396,9 +407,7 @@ class QEffLlamaSwiftKVModel(nn.Module):
                     )
                 # kv_seq_len = past_key_values.get_seq_length(self_attn.layer_idx)
 
-            _, key_states = qeff_apply_rotary_pos_emb(
-                torch.empty_like(key_states), key_states, self.cos_cached, self.sin_cached, position_ids
-            )
+            _, key_states = qeff_apply_rotary_pos_emb(torch.empty_like(key_states), key_states, cos, sin)
             cache_kwargs = {"position_ids": position_ids, "batch_index": batch_index}
             past_key_values.write_only(key_states, value_states, self_attn.layer_idx, cache_kwargs)
 
@@ -431,6 +440,8 @@ class QEffLlamaSwiftKVModel(nn.Module):
 class QEffLlamaSwiftKVForCausalLM(PreTrainedModel):
     config_class = QEffLlamaSwiftKVConfig
 
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
     def __init__(self, config: QEffLlamaSwiftKVConfig):
         super().__init__(config=config)
 
@@ -440,6 +451,7 @@ class QEffLlamaSwiftKVForCausalLM(PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.config = config
+        self.post_init()
 
     def get_submodules_for_export(self) -> Type[nn.Module]:
         """
@@ -449,6 +461,18 @@ class QEffLlamaSwiftKVForCausalLM(PreTrainedModel):
             Downstream code can use this to find/build subfunctions for repeated blocks.
         """
         return {QEffLlamaSwiftKVDecoderLayer}
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -461,7 +485,7 @@ class QEffLlamaSwiftKVForCausalLM(PreTrainedModel):
         hidden_states, output_past_key_values = self.model(
             input_ids, position_ids, past_key_values, comp_ctx_lengths, batch_index
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states).float()
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
