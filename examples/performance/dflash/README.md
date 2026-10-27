@@ -171,7 +171,41 @@ block position, and all hidden states needed by the DLM are preserved. This
 applies automatically to Qwen3, Llama, Gemma4, Qwen3-VL, Qwen3.5, and Qwen3.5-MoE.
 Apart from the incompatible Qwen3.5 artifacts noted above, existing TLM QPCs remain
 usable; re-export/recompile to benefit from this optimization. DLM and vision QPCs
-are unchanged.
+are unchanged by the target logits optimization.
+
+New DLM compilations consume a full TLM prefill chunk in one call for all supported
+text and vision-language models. There is still one DLM specialization: target
+features use `--prefill_seq_len`, while noise inputs and draft outputs stay
+block-sized. Decode pads unused target positions with `-1`; noise positions are
+unchanged. Override with `--dlm-target-seq-len` (a block-size multiple that divides
+the TLM prefill length); use the draft block size to compare with the old path.
+
+Only the DLM needs re-export/recompilation for this wider-target optimization.
+Omit `--dlm_qpc` to build it; existing TLM and vision QPCs can be reused.
+A supplied DLM QPC uses its compiled target width automatically, including legacy
+block-width QPCs. An explicitly requested width must match the supplied QPC.
+
+### Prompt Formatting and Thinking
+
+Single prompts are always wrapped in the model's native chat template, with a
+user message and an assistant-generation prefix. No task-specific instruction
+or extra system message is added by default. In the text example,
+`--format_prompt --category math` (or `coding`) adds the existing dataset-style
+instruction before chat formatting.
+
+Dataset benchmarks preserve their task instructions: text datasets use
+`utils.py`, and MathVision requests a boxed answer or option letter. Do not pass
+an already chat-formatted prompt, because it would be wrapped twice.
+
+Thinking follows the model's chat-template default in all DFlash examples and
+benchmarks. This retains thinking for the Qwen3/Qwen3.5 templates used in our
+runs. Use `--enable-thinking` or `--disable-thinking` to override it where the
+model supports that option; underscore aliases are also accepted. Templates
+without a thinking mode are not given synthetic thinking tokens.
+
+Baseline and DFlash comparisons must use the same task instructions, chat
+template, thinking setting, image processing, and generation limits. These
+prompt settings do not require recompiling QPCs.
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -180,7 +214,9 @@ are unchanged.
 | `--tlm_cores` / `--dlm_cores` | `8` | per-side core count |
 | `--ctx_len` | `4096` | both scripts |
 | `--prefill_seq_len` | `128` | |
+| `--dlm-target-seq-len` | TLM prefill width | New DLM compilation; reused QPCs use their compiled width |
 | `--generation_len` | `256` (text script) / `1800` (vision script) | |
+| `--enable-thinking` / `--disable-thinking` | model template | Mutually exclusive; only affects models with a thinking option |
 | `--iteration` | `300` | max SPD iterations |
 | `--hf_token` | `$HF_TOKEN` | required for gated repos |
 | `--tlm_hf_path` | from `MODEL_MAP` | required when the map entry has `None` (VLM entries) |

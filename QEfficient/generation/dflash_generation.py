@@ -157,15 +157,22 @@ def _run_spd_core(
     prefill_start = time.time() if prefill_start_time is None else prefill_start_time
     num_chunks = padded_len // prompt_chunk_size
 
+    target_seq_len = block_size
+    if "target_hidden" in getattr(dlm_session, "binding_index_map", {}):
+        target_index = dlm_session.binding_index_map["target_hidden"]
+        target_seq_len = int(dlm_session.bindings[target_index].dims[1])
+    if target_seq_len < block_size or target_seq_len % block_size or prompt_chunk_size % target_seq_len:
+        raise ValueError("DLM target length must be a multiple of block_size and divide the TLM prefill length.")
+
     def run_dlm_prefill_block(hidden_states, position_ids, sub_start, sub_len):
-        target_hidden = np.zeros((batch_size, block_size, hidden_size), dtype=np.float32)
-        position_ids_target = np.full((batch_size, block_size), -1, dtype=position_ids.dtype)
+        target_hidden = np.zeros((batch_size, target_seq_len, hidden_size), dtype=np.float32)
+        position_ids_target = np.full((batch_size, target_seq_len), -1, dtype=position_ids.dtype)
         target_hidden[:, :sub_len, :] = hidden_states[:, sub_start : sub_start + sub_len, :]
         position_ids_target[:, :sub_len] = position_ids[:, sub_start : sub_start + sub_len]
         dlm_inputs.update(
             {
                 "input_ids": np.full((batch_size, block_size), mask_token_id, dtype=np.int64),
-                "position_ids": position_ids_target + block_size,
+                "position_ids": position_ids_target.max(axis=1, keepdims=True) + 1 + np.arange(block_size),
                 "position_ids_target": position_ids_target,
                 "target_hidden": target_hidden,
             }
@@ -179,22 +186,22 @@ def _run_spd_core(
         flat_pos_chunk = flat_position_ids[:, chunk_start:chunk_end]
 
         if chunk_index < num_chunks - 1:
-            for sub_start in range(0, prompt_chunk_size, block_size):
-                sub_len = min(block_size, prompt_chunk_size - sub_start)
+            for sub_start in range(0, prompt_chunk_size, target_seq_len):
+                sub_len = min(target_seq_len, prompt_chunk_size - sub_start)
                 run_dlm_prefill_block(target_hidden, flat_pos_chunk, sub_start, sub_len)
             continue
 
         last_prefill_pos_in_chunk = int(flat_pos_chunk.argmax())
         logit_index = 0 if tlm_logits.shape[1] == 1 else last_prefill_pos_in_chunk
         new_tlm_token = tlm_logits[:, logit_index]
-        last_sub_start = (last_prefill_pos_in_chunk // block_size) * block_size
+        last_sub_start = (last_prefill_pos_in_chunk // target_seq_len) * target_seq_len
 
-        for sub_start in range(0, last_sub_start, block_size):
-            run_dlm_prefill_block(target_hidden, flat_pos_chunk, sub_start, block_size)
+        for sub_start in range(0, last_sub_start, target_seq_len):
+            run_dlm_prefill_block(target_hidden, flat_pos_chunk, sub_start, target_seq_len)
 
-        sub_len = min(block_size, prompt_chunk_size - last_sub_start)
-        final_hidden = np.zeros((batch_size, block_size, hidden_size), dtype=np.float32)
-        final_position_ids = np.full((batch_size, block_size), -1, dtype=flat_pos_chunk.dtype)
+        sub_len = min(target_seq_len, prompt_chunk_size - last_sub_start)
+        final_hidden = np.zeros((batch_size, target_seq_len, hidden_size), dtype=np.float32)
+        final_position_ids = np.full((batch_size, target_seq_len), -1, dtype=flat_pos_chunk.dtype)
         final_hidden[:, :sub_len, :] = target_hidden[:, last_sub_start : last_sub_start + sub_len, :]
         final_position_ids[:, :sub_len] = flat_pos_chunk[:, last_sub_start : last_sub_start + sub_len]
 
@@ -287,6 +294,13 @@ def _run_spd_core(
         dlm_inputs["position_ids"] = np.arange(spd_counter_idx + 1, spd_counter_idx + block_size + 1).reshape(1, -1)
         input_ids_block[:, 0] = new_tlm_token
         dlm_inputs["input_ids"] = input_ids_block
+        if target_seq_len != block_size:
+            padded_positions = np.full((batch_size, target_seq_len), -1, dtype=np.int64)
+            padded_positions[:, :block_size] = dlm_inputs["position_ids_target"]
+            dlm_inputs["position_ids_target"] = padded_positions
+            padded_hidden = np.zeros((batch_size, target_seq_len, hidden_size), dtype=np.float32)
+            padded_hidden[:, :block_size] = target_hidden
+            target_hidden = padded_hidden
         dlm_inputs["target_hidden"] = target_hidden
         dlm_outputs = dlm_session.run(dlm_inputs)
         metrics.dlm_decode_time += time.time() - dlm_decode_start
@@ -523,7 +537,7 @@ def run_spd_inference_gemma4(
     )
 
 
-def build_inputs_gemma4(processor, tokenizer, user_prompt, image=None, system_prompt=None):
+def build_inputs_gemma4(processor, tokenizer, user_prompt, image=None, system_prompt=None, enable_thinking=None):
     """Build processor inputs for a gemma text or image+text prompt.
 
     Returns (input_ids [1, L] int64, mm_token_type_ids [1, L] int64 or None,
@@ -555,6 +569,7 @@ def build_inputs_gemma4(processor, tokenizer, user_prompt, image=None, system_pr
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
+        **({} if enable_thinking is None else {"enable_thinking": enable_thinking}),
     )
     input_ids = inputs["input_ids"].detach().cpu().numpy()
     mm_ids = None
@@ -563,9 +578,11 @@ def build_inputs_gemma4(processor, tokenizer, user_prompt, image=None, system_pr
     return input_ids, mm_ids, inputs
 
 
-def build_input_ids_gemma4(processor, tokenizer, user_prompt, system_prompt=None):
+def build_input_ids_gemma4(processor, tokenizer, user_prompt, system_prompt=None, enable_thinking=None):
     """Back-compat shim: return only input_ids (text-only callers)."""
-    input_ids, _, _ = build_inputs_gemma4(processor, tokenizer, user_prompt, system_prompt=system_prompt)
+    input_ids, _, _ = build_inputs_gemma4(
+        processor, tokenizer, user_prompt, system_prompt=system_prompt, enable_thinking=enable_thinking
+    )
     return input_ids
 
 
@@ -668,7 +685,7 @@ def build_decode_position_ids_qwen3_vl(flat_row: np.ndarray, rope_delta: int) ->
     return np.concatenate([flat_row[None], np.repeat(mrope_row[None], 3, axis=0)], axis=0)
 
 
-def build_inputs_qwen3_vl(processor, user_prompt, image=None):
+def build_inputs_qwen3_vl(processor, user_prompt, image=None, enable_thinking=None):
     """Build processor inputs for a qwen3-vl text or image+text prompt.
 
     Returns (processor_inputs dict). With image=None this is the text-only path (no
@@ -679,7 +696,12 @@ def build_inputs_qwen3_vl(processor, user_prompt, image=None):
         content.append({"type": "image", "image": image})
     content.append({"type": "text", "text": user_prompt})
     messages = [{"role": "user", "content": content}]
-    chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    chat_text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **({} if enable_thinking is None else {"enable_thinking": enable_thinking}),
+    )
     image_inputs, video_inputs = process_vision_info(messages) if image is not None else (None, None)
     proc_inputs = processor(
         text=[chat_text],
@@ -690,17 +712,6 @@ def build_inputs_qwen3_vl(processor, user_prompt, image=None):
     )
     proc_inputs.pop("token_type_ids", None)
     return proc_inputs
-
-
-def run_vision_encoder_qwen3_vl(vision_session, pixel_values, image_grid_thw):
-    """Run the qwen3-vl vision-encoder QPC to produce (vision_embeds, deepstack_features)."""
-    vision_outputs = vision_session.run(
-        {
-            "pixel_values": pixel_values.astype(np.float16),
-            "image_grid_thw": image_grid_thw,
-        }
-    )
-    return vision_outputs["vision_embeds"], vision_outputs["deepstack_features"]
 
 
 def get_qwen35_target_seq_len(tlm_session: QAICInferenceSession, block_size: int) -> int:
@@ -738,6 +749,7 @@ def run_spd_inference_qwen3_vl(
     compiled_width: int = 536,
     batch_size: int = 1,
     tlm_prefill_session: QAICInferenceSession | None = None,
+    enable_thinking: bool | None = None,
 ) -> SpecDecodingMetrics:
     """Run Qwen3-VL, Qwen3.5 or Qwen3.5-MoE DFlash for a text or image prompt."""
     is_qwen35 = tlm_config.model_type in {"qwen3_5", "qwen3_5_moe"}
@@ -755,7 +767,7 @@ def run_spd_inference_qwen3_vl(
 
     if image is not None:
         image = image.resize((compiled_width, compiled_height))
-    processor_inputs = build_inputs_qwen3_vl(processor, prompt_text, image=image)
+    processor_inputs = build_inputs_qwen3_vl(processor, prompt_text, image=image, enable_thinking=enable_thinking)
     input_ids_length = processor_inputs["input_ids"].shape[1]
     padded_len = -(input_ids_length // -prompt_chunk_size) * prompt_chunk_size
 

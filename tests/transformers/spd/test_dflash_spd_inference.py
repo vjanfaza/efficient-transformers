@@ -113,7 +113,9 @@ def test_qwen35_vision_cli_accepts_long_context(monkeypatch, ctx_len, model_type
         ["basic_inference_vision.py", "--model_name", model_name, "--image", "--ctx_len", str(ctx_len)],
     )
     monkeypatch.setattr(
-        utils.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(model_type=model_type)
+        utils.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(model_type=model_type, to_dict=lambda: {"block_size": 16}),
     )
 
     def stop_compile(*args, **kwargs):
@@ -274,7 +276,7 @@ def test_qwen35_compile_preserves_dflash_metadata(monkeypatch, block_size, model
 
     calls = []
     text_model = SimpleNamespace(fc=torch.nn.Linear(8, 4, bias=False), hidden_norm=torch.nn.LayerNorm(4))
-    qaic_config = {"target_layer_ids": [2, 4]}
+    qaic_config = {"target_layer_ids": [2, 4], "dflash_dlm_repo": "draft"}
 
     def compile_model(**kwargs):
         calls.append(kwargs)

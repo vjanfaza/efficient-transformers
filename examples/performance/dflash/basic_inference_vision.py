@@ -24,10 +24,12 @@ from utils import (
     compile_qwen3vl_vlm_dlm_qpc,
     compile_qwen3vl_vlm_qpcs,
     get_dflash_block_size,
+    get_dlm_target_seq_len,
     get_spd_prompt_chunk_size,
     load_spd_session,
     load_spd_sessions,
     resolve_model_name,
+    validate_dlm_target_seq_len,
     validate_spd_decode_specialization,
 )
 
@@ -50,7 +52,6 @@ sys.path.insert(0, THIS_DIR)
 console = Console()
 IMAGE_PROMPT = "Can you Describe this image in detail?"
 IMAGE_URL = "https://wallup.net/wp-content/uploads/2017/03/28/351036-San_Francisco-USA-bridge-sunset-Golden_Gate_Bridge-lights.jpg"
-SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 def parse_device_list(value):
@@ -70,6 +71,15 @@ def parse_args():
     parser.add_argument("--image", action="store_true")
     parser.add_argument("--image_url", default=None)
     parser.add_argument("--image_prompt", default=None)
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--enable-thinking",
+        "--enable_thinking",
+        action="store_true",
+        default=None,
+        help="Enable thinking when supported; default: model chat-template setting.",
+    )
+    thinking.add_argument("--disable-thinking", "--disable_thinking", dest="enable_thinking", action="store_false")
     parser.add_argument("--tlm_qpc", default=None)
     parser.add_argument("--vision_qpc", default=None)
     parser.add_argument("--dlm_qpc", default=None)
@@ -89,6 +99,12 @@ def parse_args():
     parser.add_argument("--dlm_cores", type=int, default=8)
     parser.add_argument("--ctx_len", type=int, default=4096)
     parser.add_argument("--prefill_seq_len", type=int, default=128)
+    parser.add_argument(
+        "--dlm-target-seq-len",
+        "--dlm_target_seq_len",
+        type=int,
+        help="DLM target width (default: prefill_seq_len for new QPCs; compiled width for reused QPCs).",
+    )
     parser.add_argument("--generation_len", type=int, default=1800)
     parser.add_argument("--iteration", type=int, default=300)
     parser.add_argument(
@@ -147,7 +163,7 @@ def _run_gemma(
         user_prompt = args.image_prompt or IMAGE_PROMPT
         image = Image.open(requests.get(image_url, stream=True, timeout=60).raw).convert("RGB")
         input_ids, mm_token_type_ids, processor_inputs = build_inputs_gemma4(
-            processor, tokenizer, user_prompt, image=image
+            processor, tokenizer, user_prompt, image=image, enable_thinking=args.enable_thinking
         )
         logger.info(f"Image: {image_url}")
         vision_devices = args.vision_devices if args.vision_devices is not None else args.tlm_devices
@@ -162,13 +178,16 @@ def _run_gemma(
         prompt_text = ""
         logger.info(f"Prompt: {user_prompt} (prompt_len={input_ids.shape[1]})")
     elif processor is not None:
-        input_ids = build_input_ids_gemma4(processor, tokenizer, args.prompt, system_prompt=SYSTEM_PROMPT)
+        input_ids = build_input_ids_gemma4(processor, tokenizer, args.prompt, enable_thinking=args.enable_thinking)
         prompt_text = ""
         logger.info(f"Input: {args.prompt[:120].strip()} (prompt_len={input_ids.shape[1]})")
     else:
         messages = [{"role": "user", "content": args.prompt}]
         prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **({} if args.enable_thinking is None else {"enable_thinking": args.enable_thinking}),
         )
         logger.info(f"Input: {args.prompt[:120].strip()}")
 
@@ -245,6 +264,7 @@ def _run_qwen3_vl(
         compiled_width=args.width if args.width is not None else 536,
         batch_size=batch_size,
         tlm_prefill_session=tlm_prefill_session,
+        enable_thinking=args.enable_thinking,
     )
     return metrics, {"vision_encode_time_s": metrics.vision_prefill_time if args.image else None}
 
@@ -261,6 +281,8 @@ def main():
         raise ValueError(f"No default TLM HF path for '{args.model_name}'. Pass --tlm_hf_path.")
 
     tlm_config = AutoConfig.from_pretrained(tlm_repo, trust_remote_code=True, token=args.hf_token)
+    config = AutoConfig.from_pretrained(dlm_repo, token=args.hf_token, trust_remote_code=True)
+    get_dlm_target_seq_len(get_dflash_block_size(config), args.prefill_seq_len, args.dlm_target_seq_len)
     is_qwen3vl = tlm_config.model_type in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
     if args.disagg_tlm is None:
         args.disagg_tlm = tlm_config.model_type == "qwen3_5_moe"
@@ -301,6 +323,8 @@ def main():
         dlm_qpc = compile_dlm(
             tlm_repo,
             dlm_repo,
+            prefill_seq_len=args.prefill_seq_len,
+            target_seq_len=args.dlm_target_seq_len,
             ctx_len=args.ctx_len,
             num_cores=args.dlm_cores,
             num_devices=len(args.dlm_devices),
@@ -314,7 +338,6 @@ def main():
     logger.info(f"DLM qpc: {dlm_qpc}")
 
     tokenizer = AutoTokenizer.from_pretrained(tlm_repo, token=args.hf_token, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(dlm_repo, token=args.hf_token, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     try:
@@ -332,6 +355,7 @@ def main():
     prompt_chunk_size = get_spd_prompt_chunk_size(tlm_prefill_session or tlm_session)
     target_decode_length = get_dflash_block_size(config)
     validate_spd_decode_specialization(tlm_session, target_decode_length)
+    validate_dlm_target_seq_len(dlm_session, target_decode_length, prompt_chunk_size, args.dlm_target_seq_len)
 
     if is_qwen3vl:
         metrics, output_extra = _run_qwen3_vl(
