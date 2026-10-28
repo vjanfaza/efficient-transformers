@@ -53,9 +53,8 @@ class SpecDecodingMetrics:
         self.block_size = block_size
         self.total_prefill_time = 0.0
         self.tlm_decode_time = 0.0
-        self.tlm_verify_time = 0.0
-        self.tlm_commit_time = 0.0
         self.dlm_decode_time = 0.0
+        self.decode_wall_time = 0.0
         self.total_accepted_tokens = 0
         self.total_rejected_tokens = 0
         self.total_generated_tokens = 0
@@ -131,7 +130,7 @@ def _run_spd_core(
     generated_ids: np.ndarray,
     metrics: SpecDecodingMetrics,
     prefill_start_time: float | None = None,
-    tlm_commit: Callable[[np.ndarray, np.ndarray, int], None] | None = None,
+    queue_accepted_prefix: Callable[[np.ndarray, np.ndarray, int], None] | None = None,
 ) -> SpecDecodingMetrics:
     """Run model-independent DFlash prefill, verification, and cache advancement.
 
@@ -225,6 +224,7 @@ def _run_spd_core(
     gen_idx = 0
     iteration_count = 0
     continue_generation = True
+    decode_wall_start = time.perf_counter()
 
     while gen_idx < generation_limit and iteration_count < max_iterations and continue_generation:
         iteration_count += 1
@@ -233,9 +233,7 @@ def _run_spd_core(
 
         tlm_decode_start = time.time()
         tlm_logits, target_hidden = tlm_decode(dlm_candidates, dlm_inputs["position_ids"])
-        verify_time = time.time() - tlm_decode_start
-        metrics.tlm_verify_time += verify_time
-        metrics.tlm_decode_time += verify_time
+        metrics.tlm_decode_time += time.time() - tlm_decode_start
 
         accepted_length = 0
         rejected_flag = False
@@ -272,15 +270,9 @@ def _run_spd_core(
         if any(tok_id in eos_token_ids for tok_id in this_iter_gen_ids):
             continue_generation = False
 
-        if tlm_commit is not None:
-            # A commit call reuses the session's output buffers. Preserve the
-            # verification features that the draft model consumes next.
-            target_hidden = target_hidden.copy()
-            commit_start = time.time()
-            tlm_commit(dlm_candidates, dlm_inputs["position_ids"], accepted_length + 1)
-            commit_time = time.time() - commit_start
-            metrics.tlm_commit_time += commit_time
-            metrics.tlm_decode_time += commit_time
+        if queue_accepted_prefix is not None:
+            # Queue the accepted prefix; the next verification call commits it.
+            queue_accepted_prefix(dlm_candidates, dlm_inputs["position_ids"], accepted_length + 1)
 
         if not continue_generation or gen_idx >= generation_limit:
             break
@@ -307,6 +299,7 @@ def _run_spd_core(
         dlm_candidates = dlm_outputs["logits"].argmax(axis=-1)
 
     metrics.num_total_iters = iteration_count
+    metrics.decode_wall_time += time.perf_counter() - decode_wall_start
     return metrics
 
 
@@ -715,16 +708,29 @@ def build_inputs_qwen3_vl(processor, user_prompt, image=None, enable_thinking=No
 
 
 def get_qwen35_target_seq_len(tlm_session: QAICInferenceSession, block_size: int) -> int:
-    """Require block-sized verification, independently of prompt prefill."""
+    """Require concatenated verification independently of prompt prefill."""
     index = tlm_session.binding_index_map["input_ids"]
-    lengths = {shape[index][1][1] for shape in tlm_session.allowed_shapes}
-    if not lengths:
-        lengths = {tlm_session.bindings[index].dims[1]}
-    if block_size in lengths:
-        return block_size
+    selection_index = tlm_session.binding_index_map.get("num_logits_to_keep")
+    logits_index = tlm_session.binding_index_map.get("logits")
+    shapes = tlm_session.allowed_shapes or [[(None, binding.dims) for binding in tlm_session.bindings]]
+    # Single-specialization QPCs can fold away num_logits_to_keep.
+    lengths = {
+        shape[index][1][1]
+        for shape in shapes
+        if (selection_index is not None and shape[selection_index][1][0] == block_size)
+        or (
+            selection_index is None
+            and logits_index is not None
+            and len(shape[logits_index][1]) >= 2
+            and shape[logits_index][1][1] == block_size
+        )
+    }
+    if 2 * block_size in lengths:
+        return 2 * block_size
     raise ValueError(
-        f"Qwen3.5 DFlash requires a {block_size}-token verification specialization "
-        f"(found {sorted(lengths)}). Recompile the TLM with dflash_block_size={block_size}."
+        f"Qwen3.5 DFlash requires a {2 * block_size}-token concatenated "
+        f"verification specialization with num_logits_to_keep={block_size} (found {sorted(lengths)}). "
+        f"Older two-call QPCs are unsupported. Re-export and recompile the TLM with dflash_block_size={block_size}."
     )
 
 
@@ -757,9 +763,13 @@ def run_spd_inference_qwen3_vl(
         raise ValueError("Qwen3.5 DFlash requires batch size 1 and a TLM QPC with cache_commit input.")
     target_seq_len = block_size
     if is_qwen35:
-        if block_size < 2 or prompt_chunk_size < block_size or prompt_chunk_size % block_size:
-            raise ValueError("Qwen3.5 DFlash requires prefill length to be a positive multiple of block_size >= 2.")
+        if block_size < 2 or prompt_chunk_size < 2 * block_size or prompt_chunk_size % block_size:
+            raise ValueError(
+                "Qwen3.5 DFlash requires prefill length to be a multiple of block_size and >= 2 * block_size."
+            )
         target_seq_len = get_qwen35_target_seq_len(tlm_session, block_size)
+    replay_ids = np.full((batch_size, block_size), tokenizer.pad_token_id, dtype=np.int64) if is_qwen35 else None
+    replay_positions = np.full((4, batch_size, block_size), -1, dtype=np.int64) if is_qwen35 else None
     metrics = SpecDecodingMetrics(block_size=block_size)
     prefill_session = tlm_prefill_session or tlm_session
     handoff = DFlashTlmHandoff(prefill_session, tlm_session) if tlm_prefill_session is not None else None
@@ -833,7 +843,7 @@ def run_spd_inference_qwen3_vl(
     if is_qwen35:
         lang_extra["cache_commit"] = np.ones(1, dtype=np.int64)
     prefill_selection = _dflash_logit_selection_inputs(prefill_session, 1)
-    decode_selection = _dflash_logit_selection_inputs(tlm_session, target_seq_len)
+    decode_selection = _dflash_logit_selection_inputs(tlm_session, block_size)
     prefill_logits = 1 if prefill_selection or tlm_prefill_session is not None else prompt_chunk_size
     prefill_session.set_buffers({"logits": np.zeros((batch_size, prefill_logits), dtype=np.int32)})
     prefill_session.set_buffers(
@@ -858,7 +868,7 @@ def run_spd_inference_qwen3_vl(
         return outputs["logits"], outputs["hidden_states"]
 
     def prepare_decode():
-        tlm_session.set_buffers({"logits": np.zeros((batch_size, target_seq_len), dtype=np.int32)})
+        tlm_session.set_buffers({"logits": np.zeros((batch_size, block_size), dtype=np.int32)})
         tlm_session.set_buffers(
             {"hidden_states": np.zeros((batch_size, target_seq_len, hidden_size), dtype=np.float32)}
         )
@@ -867,18 +877,13 @@ def run_spd_inference_qwen3_vl(
         if is_qwen35:
             lang_extra["cache_commit"] = np.zeros(1, dtype=np.int64)
 
-    def decode_inputs(draft_ids, decode_position_ids, valid_tokens):
-        positions = build_decode_position_ids_qwen3_vl(decode_position_ids, rope_delta)
-        if is_qwen35:
-            padding = target_seq_len - block_size
-            draft_ids = np.pad(draft_ids, ((0, 0), (0, padding)), constant_values=tokenizer.pad_token_id)
-            positions = np.pad(positions, ((0, 0), (0, 0), (0, padding)), constant_values=-1)
-            positions[:, :, valid_tokens:] = -1
-        return {"input_ids": draft_ids, "position_ids": positions, **decode_selection, **lang_extra}
-
     def tlm_decode(draft_ids, decode_position_ids):
         nonlocal handoff
-        inputs = decode_inputs(draft_ids, decode_position_ids, block_size)
+        positions = build_decode_position_ids_qwen3_vl(decode_position_ids, rope_delta)
+        if is_qwen35:
+            draft_ids = np.concatenate([replay_ids, draft_ids], axis=-1)
+            positions = np.concatenate([replay_positions, positions], axis=-1)
+        inputs = {"input_ids": draft_ids, "position_ids": positions, **decode_selection, **lang_extra}
         if handoff is not None:
             inputs.update(handoff.inputs)
         outputs = tlm_session.run(inputs)
@@ -886,15 +891,12 @@ def run_spd_inference_qwen3_vl(
             tlm_session.skip_buffers(handoff.inputs)
             tlm_session.skip_buffers(vision_outputs.keys())
             handoff = None
-        return outputs["logits"][:, :block_size], outputs["hidden_states"][:, :block_size]
+        return outputs["logits"][:, :block_size], outputs["hidden_states"][:, -block_size:]
 
-    def tlm_commit(draft_ids, decode_position_ids, count):
-        tlm_session.run(
-            {
-                **decode_inputs(draft_ids, decode_position_ids, count),
-                "cache_commit": np.ones(1, dtype=np.int64),
-            }
-        )
+    def queue_accepted_prefix(draft_ids, decode_position_ids, count):
+        replay_ids[:] = draft_ids
+        replay_positions[:] = build_decode_position_ids_qwen3_vl(decode_position_ids, rope_delta)
+        replay_positions[:, :, count:] = -1
 
     eos_token_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
     return _run_spd_core(
@@ -915,5 +917,5 @@ def run_spd_inference_qwen3_vl(
         generated_ids=generated_ids,
         metrics=metrics,
         prefill_start_time=prefill_start,
-        tlm_commit=tlm_commit if is_qwen35 else None,
+        queue_accepted_prefix=queue_accepted_prefix if is_qwen35 else None,
     )

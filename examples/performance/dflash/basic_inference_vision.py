@@ -401,12 +401,18 @@ def main():
         print(f"  {'TLM Rounds (round/s)':<30} {round_rate:>6.1f}")
     else:
         print(f"  {'TLM Throughput  (tok/s)':<30} {metrics.tlm_tok_rate():>6.1f}")
-    if metrics.tlm_commit_time > 0 and metrics.tlm_verify_time > 0 and metrics.num_total_iters > 0:
-        print(f"  {'TLM Verify (ms/call)':<30} {1000 * metrics.tlm_verify_time / metrics.num_total_iters:>6.1f}")
-        print(f"  {'TLM Replay (ms/call)':<30} {1000 * metrics.tlm_commit_time / metrics.num_total_iters:>6.1f}")
-        verified_rate = metrics.block_size * metrics.num_total_iters / metrics.tlm_verify_time
+    if metrics.tlm_decode_time > 0 and metrics.num_total_iters > 0:
+        label = (
+            "TLM Replay+Verify (s/call)"
+            if tlm_config.model_type in {"qwen3_5", "qwen3_5_moe"}
+            else "TLM Verify (s/call)"
+        )
+        print(f"  {label:<30} {metrics.tlm_decode_time / metrics.num_total_iters:>8.4f}")
+        verified_rate = metrics.block_size * metrics.num_total_iters / metrics.tlm_decode_time
         print(f"  {'TLM Verified positions/s':<30} {verified_rate:>6.1f}")
-    print(f"  {'SPD Decode Speed (tok/s)':<30} {metrics.spd_tok_rate():>6.1f}")
+    wall_speed = metrics.total_generated_tokens / metrics.decode_wall_time if metrics.decode_wall_time else 0.0
+    print(f"  {'SPD Wall Speed (tok/s)':<30} {wall_speed:>6.1f}")
+    print(f"  {'SPD Model-call Speed (tok/s)':<30} {metrics.spd_tok_rate():>6.1f}")
     print(f"  {'Generated tokens':<30} {metrics.total_generated_tokens:>6}")
     print(f"  {'Iterations':<30} {metrics.num_total_iters:>6}")
     print(f"  {'Prefill time (s)':<30} {metrics.total_prefill_time:>6.3f}")

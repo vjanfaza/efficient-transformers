@@ -95,38 +95,85 @@ def make_tiny_qwen3_5_vlm(moe=False):
     return model_cls(config).eval()
 
 
-@pytest.mark.parametrize("accepted", [0, 1, 3])
-@pytest.mark.parametrize("prompt_len", [1, 5])
-@pytest.mark.parametrize("chunk_size", [16, 64])
-@pytest.mark.parametrize("matrix_solve", [False, True])
-@pytest.mark.parametrize("moe_flavour", [None, "decode_bmm", "expert_parallel"])
-def test_qwen3_5_dflash_replay_matches_autoregressive(
-    accepted, prompt_len, chunk_size, matrix_solve, moe_flavour, monkeypatch
-):
-    """Verify then replay a prefix; next-round results must exclude rejected tokens."""
+@pytest.mark.parametrize("moe", [False, True])
+@pytest.mark.parametrize("seq_len,num_logits", [(32, 16), (128, 1)])
+def test_qwen3_5_dflash_vllm_returns_vocabulary_logits(moe, seq_len, num_logits):
     from QEfficient import QEFFAutoModelForImageTextToText
 
-    torch.manual_seed(7)
-    moe = moe_flavour is not None
+    torch.manual_seed(23)
     hf_model = make_tiny_qwen3_5_vlm(moe=moe)
-    reference = copy.deepcopy(hf_model)
-    qaic_config = {"target_layer_ids": [1, 3]}
-    if moe:
-        qaic_config["moe_config"] = {"flavour": moe_flavour}
+    hf_model.config.text_config.max_position_embeddings = 256
+    qaic_config = {"target_layer_ids": [1, 3], "speculative_model_type": "target"}
     qeff = QEFFAutoModelForImageTextToText(hf_model, kv_offload=True, qaic_config=qaic_config)
     if moe:
         qeff.transform(
-            ctx_len=CTX_LEN,
-            seq_len=16,
+            ctx_len=256,
+            seq_len=128,
             bs=1,
             num_devices=1,
             aic_num_cores=4,
             qaic_config=qaic_config,
             prefill_only=True,
-            prefill_seq_len=16,
+            prefill_seq_len=128,
+            enable_chunking=True,
+        )
+    wrapper = qeff.lang_model.model
+    inputs = qeff.model.get_dummy_inputs(kv_offload=True, batch_size=1)["lang"]
+    inputs["input_ids"] = torch.randint(10, VOCAB_SIZE, (1, seq_len))
+    inputs["input_ids"][:, :2] = hf_model.config.image_token_id
+    inputs["vision_embeds"].normal_()
+    inputs["position_ids"] = torch.arange(seq_len).view(1, 1, -1).repeat(4, 1, 1)
+    inputs["num_logits_to_keep"] = torch.zeros((num_logits, 1), dtype=torch.int64)
+    for index, kind in enumerate(hf_model.config.text_config.layer_types):
+        if kind == "full_attention":
+            inputs["past_key_values"][index] = [
+                torch.zeros((*state.shape[:2], 256, state.shape[-1])) for state in inputs["past_key_values"][index]
+            ]
+    with torch.no_grad():
+        actual = wrapper(**copy.deepcopy(inputs))
+        wrapper.qaic_config = {"target_layer_ids": [1, 3]}
+        greedy = wrapper(**copy.deepcopy(inputs))
+    assert actual[0].shape == (1, num_logits, VOCAB_SIZE)
+    assert torch.isfinite(actual[0]).all()
+    torch.testing.assert_close(greedy[0], actual[0].argmax(-1).to(torch.int32))
+    assert actual[3].shape == (1, seq_len, 32)
+    torch.testing.assert_close(actual[1:], greedy[1:])
+    assert qeff.lang_model.hash_params["dflash_output_logits"]
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 3])
+@pytest.mark.parametrize("prompt_len", [1, 5])
+@pytest.mark.parametrize("chunk_size", [16, 64])
+@pytest.mark.parametrize("matrix_solve", [False, True])
+@pytest.mark.parametrize("moe_flavour", [None, "decode_bmm", "expert_parallel"])
+def test_qwen3_5_dflash_concatenated_matches_autoregressive(
+    accepted, prompt_len, chunk_size, matrix_solve, moe_flavour, monkeypatch
+):
+    """Commit the prior prefix and verify the next block in one target call."""
+    from QEfficient import QEFFAutoModelForImageTextToText
+
+    torch.manual_seed(7)
+    hf_model = make_tiny_qwen3_5_vlm(moe=moe_flavour is not None)
+    hf_model.config.text_config.max_position_embeddings = 512
+    reference = copy.deepcopy(hf_model).model.language_model
+    qaic_config = {"target_layer_ids": [1, 3]}
+    if moe_flavour:
+        qaic_config["moe_config"] = {"flavour": moe_flavour}
+    qeff = QEFFAutoModelForImageTextToText(hf_model, kv_offload=True, qaic_config=qaic_config)
+    if moe_flavour:
+        qeff.transform(
+            ctx_len=512,
+            seq_len=2 * chunk_size,
+            bs=1,
+            num_devices=1,
+            aic_num_cores=4,
+            qaic_config=qaic_config,
+            prefill_only=True,
+            prefill_seq_len=2 * chunk_size,
         )
     model = qeff.lang_model.model.language_model
     model.dflash_chunk_size = chunk_size
+    assert qeff.lang_model.hash_params["dflash_cache_protocol"].endswith("fused_replay_v1")
     for layer in model.layers:
         if layer.layer_type == "linear_attention":
             layer.linear_attn.dflash_matrix_solve = matrix_solve
@@ -134,53 +181,66 @@ def test_qwen3_5_dflash_replay_matches_autoregressive(
     def unexpected_decode(*args, **kwargs):
         raise AssertionError("DFlash must not compute the one-token recurrent branch")
 
-    model_type = "qwen3_5_moe" if moe else "qwen3_5"
+    model_type = "qwen3_5_moe" if moe_flavour else "qwen3_5"
     monkeypatch.setattr(
         f"QEfficient.transformers.models.{model_type}.modeling_{model_type}.recurrent_gdn_decode_forward",
         unexpected_decode,
     )
-    initial = qeff.model.get_dummy_inputs(kv_offload=True)["lang"]["past_key_values"]
-    tokens = torch.randint(10, VOCAB_SIZE, (1, 16))
-    # This standalone runtime uses a single request.
-    cache = tuple(tuple(t[:1].clone() for t in layer) for layer in initial)
-
-    def run(ids, start, state, commit, valid=None):
-        positions = torch.arange(start, start + ids.shape[1]).view(1, -1)
-        if valid is not None:
-            positions[:, valid:] = -1
-        return model(
-            input_ids=ids,
+    cache = qeff.model.get_dummy_inputs(kv_offload=True, ctx_len=512)["lang"]["past_key_values"]
+    prompt = torch.randint(10, VOCAB_SIZE, (1, 2 * chunk_size))
+    positions = torch.arange(2 * chunk_size).view(1, -1)
+    positions[:, prompt_len:] = -1
+    with torch.no_grad():
+        prefill = model(
+            input_ids=prompt,
             position_ids=positions,
-            past_key_values=state,
-            cache_commit=torch.tensor([commit]),
+            past_key_values=cache,
+            cache_commit=torch.ones(1, dtype=torch.long),
             use_cache=True,
         )
-
-    with torch.no_grad():
-        prefill = run(tokens[:, :8], 0, cache, 1, valid=prompt_len)
-        verify = run(tokens[:, prompt_len : prompt_len + 4], prompt_len, prefill.past_key_values, 0)
-        for i in (0, 2):
-            for actual, expected in zip(verify.past_key_values[i], prefill.past_key_values[i]):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        commit_count = accepted + 1  # seed token plus accepted DLM tokens
-        committed = run(
-            tokens[:, prompt_len : prompt_len + 4], prompt_len, verify.past_key_values, 1, valid=commit_count
+        cache = prefill.past_key_values
+        replay_ids = torch.zeros((1, chunk_size), dtype=torch.long)
+        replay_positions = torch.full_like(replay_ids, -1)
+        history = prompt[:, :prompt_len]
+        for count in [accepted + 1, 1, chunk_size, 3]:
+            ids = torch.randint(10, VOCAB_SIZE, (1, chunk_size))
+            pos = torch.arange(history.shape[1], history.shape[1] + chunk_size).view(1, -1)
+            output = model(
+                input_ids=torch.cat([replay_ids, ids], dim=1),
+                position_ids=torch.cat([replay_positions, pos], dim=1),
+                past_key_values=cache,
+                cache_commit=torch.zeros(1, dtype=torch.long),
+                use_cache=True,
+            )
+            expected = reference(input_ids=torch.cat([history, ids], dim=1), use_cache=False, output_hidden_states=True)
+            torch.testing.assert_close(
+                output.last_hidden_state[:, -chunk_size:],
+                expected.last_hidden_state[:, -chunk_size:],
+                rtol=2e-4,
+                atol=2e-4,
+            )
+            projection = model.hidden_norm(
+                model.fc(torch.cat([expected.hidden_states[i][:, -chunk_size:] for i in [1, 3]], dim=-1))
+            )
+            torch.testing.assert_close(output.hidden_states[:, -chunk_size:], projection, rtol=2e-4, atol=2e-4)
+            if torch.all(replay_positions == -1):
+                for layer in (0, 2):
+                    torch.testing.assert_close(output.past_key_values[layer], cache[layer], rtol=0, atol=0)
+            cache = output.past_key_values
+            replay_ids, replay_positions = ids, pos.clone()
+            replay_positions[:, count:] = -1
+            history = torch.cat([history, ids[:, :count]], dim=1)
+        restarted = model(
+            input_ids=prompt,
+            position_ids=positions,
+            past_key_values=cache,
+            cache_commit=torch.ones(1, dtype=torch.long),
+            use_cache=True,
         )
-        next_pos = prompt_len + commit_count
-        followup_ids = torch.tensor([[48, 49, 50, 51]])
-        followup = run(followup_ids, next_pos, committed.past_key_values, 0)
-        expected_ids = torch.cat([tokens[:, :next_pos], followup_ids], dim=1)
-        expected = reference.model.language_model(input_ids=expected_ids, use_cache=False, output_hidden_states=True)
-
-    torch.testing.assert_close(followup.last_hidden_state, expected.last_hidden_state[:, -4:], rtol=2e-4, atol=2e-4)
-    projection = model.hidden_norm(model.fc(torch.cat([expected.hidden_states[i][:, -4:] for i in [1, 3]], dim=-1)))
-    torch.testing.assert_close(followup.hidden_states, projection, rtol=2e-4, atol=2e-4)
-    assert followup.hidden_states.shape == (1, 4, 32)
-    with torch.no_grad():
-        restarted = run(tokens[:, :8], 0, followup.past_key_values, 1, valid=prompt_len)
-    for i in (0, 2):
-        for actual, expected in zip(restarted.past_key_values[i], prefill.past_key_values[i]):
-            torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+        for layer in (0, 2):
+            torch.testing.assert_close(
+                restarted.past_key_values[layer], prefill.past_key_values[layer], rtol=2e-4, atol=2e-4
+            )
 
 
 @pytest.mark.parametrize(
@@ -265,21 +325,29 @@ def test_qwen3_5_dflash_rejects_unsupported_prefill(prefill_seq_len):
 
 
 @pytest.mark.parametrize("dummy_seq_len", [16, 32, 128, 256, 1024])
-def test_qwen3_5_dflash_export_traces_one_chunk(dummy_seq_len):
+@pytest.mark.parametrize("moe", [False, True])
+def test_qwen3_5_dflash_export_traces_decode_width(dummy_seq_len, moe):
     from QEfficient import QEFFAutoModelForImageTextToText
 
     qeff = QEFFAutoModelForImageTextToText(
-        make_tiny_qwen3_5_vlm(), kv_offload=True, qaic_config={"target_layer_ids": [1, 3]}
+        make_tiny_qwen3_5_vlm(moe=moe),
+        kv_offload=True,
+        qaic_config={"target_layer_ids": [1, 3]},
     )
+    decode_width = 32
     inputs = qeff.model.get_dummy_inputs(kv_offload=True, prefill_seq_len=dummy_seq_len)["lang"]
-    assert inputs["input_ids"].shape[1] == 16
-    assert inputs["position_ids"].shape[-1] == 16
+    assert inputs["input_ids"].shape[1] == decode_width
+    assert inputs["position_ids"].shape[-1] == decode_width
+    if dummy_seq_len < 32:
+        with pytest.raises(ValueError, match="prefill_seq_len >= 2"):
+            qeff.model.get_specializations(batch_size=1, prefill_seq_len=dummy_seq_len, ctx_len=2048, kv_offload=True)
+        return
     specs, _ = qeff.model.get_specializations(
         batch_size=1, prefill_seq_len=dummy_seq_len, ctx_len=2048, kv_offload=True
     )
     assert [(spec["seq_len"], spec["num_logits_to_keep"]) for spec in specs["lang"]] == [
         (dummy_seq_len, 1),
-        (16, 16),
+        (decode_width, 16),
     ]
     specs, _ = qeff.model.get_specializations(
         batch_size=1,
@@ -292,10 +360,31 @@ def test_qwen3_5_dflash_export_traces_one_chunk(dummy_seq_len):
     assert [(spec["seq_len"], spec["num_logits_to_keep"]) for spec in specs["lang"]] == [
         (dummy_seq_len, 1),
         (dummy_seq_len, 1),
-        (16, 16),
-        (16, 16),
-        (16, 16),
+        (decode_width, 16),
+        (decode_width, 16),
+        (decode_width, 16),
     ]
+
+
+@pytest.mark.parametrize("decode_width", [16, 32])
+def test_qwen3_5_dflash_runtime_distinguishes_prefill_from_verify(decode_width):
+    from types import SimpleNamespace
+
+    from QEfficient.generation.dflash_generation import get_qwen35_target_seq_len
+
+    shapes = [[(8, (1, 32)), (8, (1, 1))], [(8, (1, decode_width)), (8, (16, 1))]]
+    session = SimpleNamespace(binding_index_map={"input_ids": 0, "num_logits_to_keep": 1}, allowed_shapes=shapes)
+    if decode_width == 32:
+        assert get_qwen35_target_seq_len(session, 16) == 32
+        session.allowed_shapes = []
+        session.bindings = [SimpleNamespace(dims=(1, 32)), SimpleNamespace(dims=(16, 1))]
+        assert get_qwen35_target_seq_len(session, 16) == 32
+    else:
+        with pytest.raises(ValueError, match="Older two-call QPCs are unsupported"):
+            get_qwen35_target_seq_len(session, 16)
+    session.allowed_shapes = shapes[:1]
+    with pytest.raises(ValueError, match="Re-export and recompile"):
+        get_qwen35_target_seq_len(session, 16)
 
 
 @pytest.mark.parametrize("chunk_size", [0, 1, 3, 24])

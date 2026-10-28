@@ -1620,11 +1620,9 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         # ---Sampling---
         if self.dflash_tlm and qaic_config.get("speculative_model_type") == "target":
             self.lang_model.hash_params["dflash_output_logits"] = True
-        if self.dflash_tlm and self.model.config.model_type == "qwen3_5_moe":
-            self.lang_model.hash_params["dflash_cache_protocol"] = "qwen35_moe_dynamic_replay_v1"
-            self.lang_model.hash_params["dflash_chunk_size"] = 16
-        if self.dflash_tlm and self.model.config.model_type == "qwen3_5":
-            self.lang_model.hash_params["dflash_cache_protocol"] = "qwen35_dynamic_replay_v1"
+        if self.dflash_tlm and self.model.config.model_type in {"qwen3_5", "qwen3_5_moe"}:
+            prefix = "qwen35_moe" if self.model.config.model_type == "qwen3_5_moe" else "qwen35"
+            self.lang_model.hash_params["dflash_cache_protocol"] = f"{prefix}_fused_replay_v1"
             self.lang_model.hash_params["dflash_chunk_size"] = 16
         if self.dflash_tlm and self.model.config.model_type == "gemma4":
             self.lang_model.hash_params["dflash_cache_protocol"] = "gemma4_block_window_v1"

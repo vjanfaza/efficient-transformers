@@ -85,7 +85,7 @@ def test_qwen35_compile_accepts_context_larger_than_draft_window(monkeypatch, ct
             "Qwen/Qwen3.6-27B",
             "z-lab/Qwen3.6-27B-DFlash",
             ctx_len=ctx_len,
-            prefill_seq_len=16,
+            prefill_seq_len=32,
             num_cores=8,
             num_devices=4,
         )
@@ -143,7 +143,7 @@ def test_dflash_decode_specialization_accepts_fixed_and_dynamic_shapes(sequence_
 
 @pytest.mark.parametrize("prompt_chunk_size", [8, 31, 127])
 def test_qwen3_5_runtime_rejects_unsupported_prefill_qpc(prompt_chunk_size):
-    with pytest.raises(ValueError, match="positive multiple of block_size"):
+    with pytest.raises(ValueError, match="multiple of block_size"):
         run_spd_inference_qwen3_vl(
             prompt_text="test",
             tokenizer=None,
@@ -160,15 +160,17 @@ def test_qwen3_5_runtime_rejects_unsupported_prefill_qpc(prompt_chunk_size):
 @pytest.mark.parametrize(
     "model_type,prompt_chunk_size,target_seq_len",
     [
-        ("qwen3_5", 16, 16),
-        ("qwen3_5", 64, 16),
-        ("qwen3_5", 128, 16),
-        ("qwen3_5", 256, 16),
-        ("qwen3_5_moe", 16, 16),
-        ("qwen3_5_moe", 128, 16),
+        ("qwen3_5", 32, 32),
+        ("qwen3_5", 64, 32),
+        ("qwen3_5", 128, 32),
+        ("qwen3_5", 256, 32),
+        ("qwen3_5_moe", 32, 32),
+        ("qwen3_5_moe", 128, 32),
     ],
 )
-def test_qwen3_5_runtime_pads_verification_and_commit(monkeypatch, model_type, prompt_chunk_size, target_seq_len):
+def test_qwen3_5_runtime_concatenates_prefix_without_second_call(
+    monkeypatch, model_type, prompt_chunk_size, target_seq_len
+):
     import torch
 
     from QEfficient.generation import dflash_generation as generation
@@ -179,16 +181,19 @@ def test_qwen3_5_runtime_pads_verification_and_commit(monkeypatch, model_type, p
     def run(feeds):
         calls.append({key: value.copy() for key, value in feeds.items()})
         return {
-            "logits": np.zeros((1, target_seq_len), dtype=np.int32),
-            "hidden_states": np.zeros((1, target_seq_len, 32), dtype=np.float32),
+            "logits": np.zeros((1, feeds["num_logits_to_keep"].shape[0]), dtype=np.int32),
+            "hidden_states": np.broadcast_to(np.arange(target_seq_len)[None, :, None], (1, target_seq_len, 32)),
             "image_idx_output": np.zeros((1, 1), dtype=np.int64),
         }
 
     session = SimpleNamespace(
         input_names=["cache_commit", "vision_embeds", "num_logits_to_keep"],
-        binding_index_map={"vision_embeds": 0, "input_ids": 1},
+        binding_index_map={"vision_embeds": 0, "input_ids": 1, "num_logits_to_keep": 2},
         bindings=[SimpleNamespace(type=0, dims=(1, 1, 32)), SimpleNamespace(dims=(1, prompt_chunk_size))],
-        allowed_shapes=[[(0, [1, 1, 32]), (8, [1, length])] for length in {prompt_chunk_size, target_seq_len}],
+        allowed_shapes=[
+            [(0, [1, 1, 32]), (8, [1, length]), (8, [keep, 1])]
+            for length, keep in [(prompt_chunk_size, 1), (target_seq_len, 16)]
+        ],
         aic_to_np_dtype_mapping={0: np.dtype(np.float32)},
         run=run,
         set_buffers=buffers.append,
@@ -218,16 +223,22 @@ def test_qwen3_5_runtime_pads_verification_and_commit(monkeypatch, model_type, p
         assert hidden.shape == (1, 16, 32)
         verify = calls[-1]
         assert verify["input_ids"].shape == (1, target_seq_len)
-        np.testing.assert_array_equal(verify["position_ids"][0, :, :16], positions)
-        assert np.all(verify["position_ids"][..., 16:] == -1)
+        np.testing.assert_array_equal(verify["position_ids"][0, :, 16:], positions)
+        assert np.all(verify["position_ids"][..., :16] == -1)
+        np.testing.assert_array_equal(hidden[0, :, 0], np.arange(16, 32))
         assert verify["cache_commit"].item() == 0
         assert verify["num_logits_to_keep"].shape == (16, 1)
-        kwargs["tlm_commit"](ids, positions, 2)
-        commit = calls[-1]
-        assert commit["cache_commit"].item() == 1
-        assert commit["num_logits_to_keep"].shape == (16, 1)
-        np.testing.assert_array_equal(commit["position_ids"][0, :, :2], positions[:, :2])
-        assert np.all(commit["position_ids"][..., 2:] == -1)
+        call_count = len(calls)
+        kwargs["queue_accepted_prefix"](ids, positions, 2)
+        assert len(calls) == call_count
+        kwargs["tlm_decode"](ids + 1, positions + 2)
+        combined = calls[-1]
+        assert len(calls) == call_count + 1
+        assert combined["cache_commit"].item() == 0
+        np.testing.assert_array_equal(combined["input_ids"], np.concatenate([ids, ids + 1], axis=1))
+        np.testing.assert_array_equal(combined["position_ids"][0, :, :2], positions[:, :2])
+        assert np.all(combined["position_ids"][..., 2:16] == -1)
+        np.testing.assert_array_equal(combined["position_ids"][0, :, 16:], positions + 2)
         return kwargs["metrics"]
 
     monkeypatch.setattr(generation, "_run_spd_core", core)
@@ -245,7 +256,7 @@ def test_qwen3_5_runtime_pads_verification_and_commit(monkeypatch, model_type, p
         block_size=16,
         hidden_size=32,
     )
-    assert [item["logits"].shape[1] for item in buffers if "logits" in item] == [1, target_seq_len]
+    assert [item["logits"].shape[1] for item in buffers if "logits" in item] == [1, 16]
 
 
 @pytest.mark.parametrize("with_image", [False, True])
@@ -423,7 +434,7 @@ def test_dflash_acceptance_rate_uses_accepted_tokens():
 
 
 @pytest.mark.parametrize("accepted", [0, 1, 3])
-def test_dflash_commit_counts_seed_and_preserves_verification_features(accepted):
+def test_dflash_queued_prefix_counts_seed_and_preserves_verification_features(accepted):
     commits = []
     hidden = np.ones((1, BLOCK_SIZE, HIDDEN_SIZE), dtype=np.float32)
 
@@ -440,9 +451,8 @@ def test_dflash_commit_counts_seed_and_preserves_verification_features(accepted)
             logits[:, accepted] = 10
         return logits, hidden
 
-    def commit(ids, positions, count):
+    def queue_prefix(ids, positions, count):
         commits.append(count)
-        hidden.fill(99)  # Simulate session output-buffer reuse by the replay call.
 
     metrics = _run_spd_core(
         input_ids=np.array([[3, 4, 0, 0]]),
@@ -450,7 +460,7 @@ def test_dflash_commit_counts_seed_and_preserves_verification_features(accepted)
         tlm_prefill=lambda start, end: (np.array([[0, 5, 0, 0]]), hidden),
         prepare_decode=lambda: None,
         tlm_decode=verify,
-        tlm_commit=commit,
+        queue_accepted_prefix=queue_prefix,
         dlm_session=Draft(),
         mask_token_id=MASK_TOKEN_ID,
         vocab_size=VOCAB_SIZE,
@@ -464,7 +474,7 @@ def test_dflash_commit_counts_seed_and_preserves_verification_features(accepted)
         metrics=SpecDecodingMetrics(block_size=BLOCK_SIZE),
     )
     assert commits == [accepted + 1, accepted + 1]
-    assert metrics.tlm_decode_time == pytest.approx(metrics.tlm_verify_time + metrics.tlm_commit_time)
+    assert metrics.tlm_decode_time > 0
 
 
 def test_dflash_generation_len_caps_partial_block():

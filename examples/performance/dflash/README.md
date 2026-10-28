@@ -53,7 +53,8 @@ Use `--no-disagg-tlm` to compile or run the previous combined TLM QPC.
 Dense models keep the combined-QPC default. Split TLM currently supports BS=1.
 After the last prefill chunk, KV state (plus convolution and recurrent state
 for Qwen3.5-MoE) is transferred through host buffers to the verification QPC
-on its first call. Later verification/replay calls keep state on-device.
+on its first call. Later decode calls keep state on-device; Qwen3.5 dense/MoE
+targets concatenate the accepted-prefix replay and new verification block in one call.
 
 To reuse a split pair, pass `--tlm-prefill-qpc /path/to/prefill/qpc` and
 `--tlm_qpc /path/to/verification/qpc`. Prefill uses `--tlm_devices` unless
@@ -126,12 +127,30 @@ python basic_inference_vision.py --model_name Qwen3.5-4B \
 ```
 
 Use `--prompt "..."` instead of `--image --image_prompt ...` for text-only input.
-Prefill length can be any positive multiple of the draft block size; verification and replay remain block-sized.
+Qwen3.5 dense and MoE targets use concatenated replay and verification. Each decode call takes
+`2 * block_size` positions: the previous accepted prefix (padded with position IDs
+of `-1`), followed by the next draft block. It commits the prefix's convolution
+and recurrent states while verifying the new block without committing it.
+Only the new block's token predictions and projected features are used by DFlash.
+The first decode call has an entirely masked replay half. After each verification,
+the runtime queues the seed plus accepted draft tokens for the next call; the new
+replacement/bonus seed belongs to the verification half, not the replay half.
+The example reports this combined call as `TLM Replay+Verify`, with no separate
+device replay time. SPD wall-time throughput includes DLM calls and host orchestration;
+the rate based on time spent in model calls is shown separately, not as device-only profiling.
+Prefill length must be a multiple of the draft block size and at least twice that size.
+For a block size of 16, decode takes 32 positions and returns 16 token predictions.
 
-**Recompilation required:** Qwen3.5 DFlash TLM ONNX/QPC artifacts created before
-the variable-length prefill and block-sized verification/replay update are incompatible.
-Re-export and recompile the TLM; do not reuse those old paths with `--tlm_qpc`.
-To let this example rebuild the VLM artifacts, omit both `--tlm_qpc` and `--vision_qpc`.
+**Recompilation required to enable fused replay:** Re-export and recompile the TLM;
+older TLM ONNX/QPC artifacts cannot gain fused replay without rebuilding. The language
+export hash distinguishes the new cache protocol; existing artifacts are not deleted.
+Omit both `--tlm_qpc` and `--vision_qpc` to let this example select/compile compatible artifacts.
+The existing vision and DLM QPCs do not need to change for fused replay.
+
+The previous two-call TLM QPCs are no longer supported; the example rejects them
+with a recompilation message. There is no two-call fallback or mode switch.
+MXINT8/MXFP6 settings are unchanged. External runtimes, including vLLM, must support
+the new fused input/state contract before using these new TLM QPCs.
 
 ---
 

@@ -18,11 +18,14 @@ def dflash_chunk_gated_delta_scan(
     decay_mask: torch.Tensor,
     mask_strict: torch.Tensor,
     state: torch.Tensor,
+    commit_final: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Preserve the recurrent chunk loop in ONNX for sequence specialization."""
+    """Commit all prefill chunks, or retain the state before the verification chunk."""
     output = torch.zeros_like(value)
     batch, heads, chunk = query.shape[0], query.shape[1], query.shape[3]
+    prefix_state = state
     for i in range(query.shape[2]):
+        prefix_state = state
         q_i = query[:, :, i : i + 1].reshape(batch, heads, chunk, query.shape[4])
         k_i = key[:, :, i : i + 1].reshape(batch, heads, chunk, key.shape[4])
         v_i = value[:, :, i : i + 1].reshape(batch, heads, chunk, value.shape[4])
@@ -38,7 +41,7 @@ def dflash_chunk_gated_delta_scan(
         state = (
             state * last_g.exp().unsqueeze(-1) + (k_i * (last_g - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
         )
-    return output, state
+    return output, torch.where(commit_final.to(torch.bool), state, prefix_state)
 
 
 def compute_dflash_target_hidden_states(

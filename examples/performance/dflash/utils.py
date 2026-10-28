@@ -21,6 +21,7 @@ from QEfficient.generation.cloud_infer import (
     QAICInferenceSession,
     is_retained_state_name,
 )
+from QEfficient.generation.dflash_generation import get_qwen35_target_seq_len
 from QEfficient.utils.logging_utils import QEFFLogger
 
 logger = QEFFLogger.get_logger("INFRA")
@@ -86,6 +87,12 @@ def get_spd_prompt_chunk_size(tlm_session: QAICInferenceSession) -> int:
 
 def validate_spd_decode_specialization(tlm_session: QAICInferenceSession, block_size: int) -> None:
     """Require a TLM specialization that verifies one complete DFlash block."""
+    if "cache_commit" in getattr(tlm_session, "input_names", ()):
+        seq_len = get_qwen35_target_seq_len(tlm_session, block_size)
+        logger.info(
+            f"TLM uses concatenated replay + verification: {seq_len} input positions, {block_size} predictions."
+        )
+        return
     input_index = tlm_session.binding_index_map["input_ids"]
     sequence_lengths = sorted({shape[input_index][1][1] for shape in tlm_session.allowed_shapes})
     if not sequence_lengths:
@@ -455,9 +462,11 @@ def compile_qwen3vl_vlm_qpcs(
     if is_qwen35 or is_qwen35_moe:
         if block_size < 2 or block_size & (block_size - 1):
             raise ValueError("Qwen3.5 DFlash requires a power-of-two draft block_size >= 2.")
-        if prefill_seq_len < block_size or prefill_seq_len % block_size:
-            raise ValueError(f"Qwen3.5 DFlash requires prefill_seq_len to be a positive multiple of {block_size}.")
-        logger.warning("Qwen3.5 DFlash uses accepted-prefix replay; target timing includes the extra commit pass.")
+        if prefill_seq_len < 2 * block_size or prefill_seq_len % block_size:
+            raise ValueError(
+                f"Qwen3.5 DFlash requires prefill_seq_len to be a multiple of {block_size} and at least {2 * block_size}."
+            )
+        logger.info("Qwen3.5 DFlash combines accepted-prefix replay and verification in one TLM call.")
     tlm_qeff = QEFFAutoModelForImageTextToText.from_pretrained(
         tlm_repo,
         config=config,
@@ -469,8 +478,7 @@ def compile_qwen3vl_vlm_qpcs(
         qaic_config=qaic_config,
     )
 
-    # DFlashTLMTransform attached fc/hidden_norm but left them random; copy in the real
-    # DFlash weights and scale fc into fp16 range.
+    # Apply the DLM projection weights with the same fp16-range scaling as the transform.
     text_model = tlm_qeff.lang_model.model.language_model
     text_model.fc.weight.data.copy_(state_dict["fc.weight"].to(torch.float32))
     with torch.no_grad():
@@ -493,7 +501,7 @@ def compile_qwen3vl_vlm_qpcs(
         "dflash_block_size": block_size,
     }
     if is_qwen35 or is_qwen35_moe:
-        # Hybrid verification and accepted-prefix replay use chunk attention.
+        # Concatenated replay and verification use chunk attention.
         compile_kwargs["prefill_only"] = True
     if is_qwen35_moe:
         compile_kwargs["qaic_config"] = qaic_config
