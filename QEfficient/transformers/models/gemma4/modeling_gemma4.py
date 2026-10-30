@@ -767,10 +767,12 @@ class QEffGemma4TextModel(Gemma4TextModel):
             past_key_values = QEffGemma4DynamicCache(config=self.config)
 
         if getattr(self, "target_layer_ids", None) and past_key_values is not None:
-            # DFlash reserves block headroom; the attention window stays unchanged.
+            # Derive DFlash's cache capacity inside each update so subfunctions
+            # resolve it from their KV input shape, not a captured scalar tensor.
+            # The attention window remains unchanged.
             for layer in past_key_values.layers:
                 if layer.is_sliding and layer.keys is not None:
-                    layer.sliding_window = layer.keys.shape[2]
+                    layer.sliding_window = None
 
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
