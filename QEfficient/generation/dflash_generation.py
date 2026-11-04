@@ -53,6 +53,8 @@ class SpecDecodingMetrics:
         self.block_size = block_size
         self.total_prefill_time = 0.0
         self.tlm_decode_time = 0.0
+        self.tlm_verify_time = 0.0
+        self.tlm_commit_time = 0.0
         self.dlm_decode_time = 0.0
         self.decode_wall_time = 0.0
         self.total_accepted_tokens = 0
@@ -111,6 +113,22 @@ def _dflash_logit_selection_inputs(tlm_session, num_logits: int) -> dict[str, np
     return {"num_logits_to_keep": np.zeros((num_logits, 1), dtype=np.int64)}
 
 
+def _format_position_ids_for_session(session: QAICInferenceSession, position_ids: np.ndarray) -> np.ndarray:
+    """Expand flat text positions for Qwen3.5 mRoPE QPCs when required."""
+    position_ids = np.asarray(position_ids)
+    position_index = getattr(session, "binding_index_map", {}).get("position_ids")
+    if position_ids.ndim != 2 or position_index is None:
+        return position_ids
+    position_shapes = [shape[position_index][1] for shape in getattr(session, "allowed_shapes", ())]
+    bindings = getattr(session, "bindings", ())
+    if not position_shapes and position_index < len(bindings):
+        position_shapes = [bindings[position_index].dims]
+    mrope_dims = {shape[0] for shape in position_shapes if len(shape) == 3}
+    if len(mrope_dims) != 1:
+        return position_ids
+    return np.repeat(position_ids[np.newaxis, ...], mrope_dims.pop(), axis=0)
+
+
 def _run_spd_core(
     *,
     input_ids: np.ndarray,
@@ -131,6 +149,7 @@ def _run_spd_core(
     metrics: SpecDecodingMetrics,
     prefill_start_time: float | None = None,
     queue_accepted_prefix: Callable[[np.ndarray, np.ndarray, int], None] | None = None,
+    draft_selector: Callable[[dict[str, np.ndarray], np.ndarray], np.ndarray] | None = None,
 ) -> SpecDecodingMetrics:
     """Run model-independent DFlash prefill, verification, and cache advancement.
 
@@ -217,7 +236,11 @@ def _run_spd_core(
         dlm_outputs = dlm_session.run(dlm_inputs)
 
     metrics.total_prefill_time += time.time() - prefill_start
-    dlm_candidates = dlm_outputs["logits"].argmax(axis=-1)
+    dlm_candidates = (
+        draft_selector(dlm_outputs, input_ids_block[:, 0])
+        if draft_selector is not None
+        else dlm_outputs["logits"].argmax(axis=-1)
+    )
     prepare_decode()
 
     generation_limit = min(generation_len, generated_ids.shape[1])
@@ -233,7 +256,9 @@ def _run_spd_core(
 
         tlm_decode_start = time.time()
         tlm_logits, target_hidden = tlm_decode(dlm_candidates, dlm_inputs["position_ids"])
-        metrics.tlm_decode_time += time.time() - tlm_decode_start
+        verify_time = time.time() - tlm_decode_start
+        metrics.tlm_verify_time += verify_time
+        metrics.tlm_decode_time += verify_time
 
         accepted_length = 0
         rejected_flag = False
@@ -296,7 +321,11 @@ def _run_spd_core(
         dlm_inputs["target_hidden"] = target_hidden
         dlm_outputs = dlm_session.run(dlm_inputs)
         metrics.dlm_decode_time += time.time() - dlm_decode_start
-        dlm_candidates = dlm_outputs["logits"].argmax(axis=-1)
+        dlm_candidates = (
+            draft_selector(dlm_outputs, input_ids_block[:, 0])
+            if draft_selector is not None
+            else dlm_outputs["logits"].argmax(axis=-1)
+        )
 
     metrics.num_total_iters = iteration_count
     metrics.decode_wall_time += time.perf_counter() - decode_wall_start
@@ -321,6 +350,7 @@ def run_spd_inference_single(
     generation_len: int = 256,
     batch_size: int = 1,
     tlm_prefill_session: QAICInferenceSession | None = None,
+    draft_selector: Callable[[dict[str, np.ndarray], np.ndarray], np.ndarray] | None = None,
 ) -> SpecDecodingMetrics:
     input_ids, position_ids = _prepare_text_inputs(tokenizer, prompt_text, prompt_chunk_size)
     generated_ids = _initialize_generated_ids(batch_size, ctx_len, input_ids.shape[1], tokenizer.pad_token_id)
@@ -328,6 +358,18 @@ def run_spd_inference_single(
 
     prefill_session = tlm_prefill_session or tlm_session
     handoff = DFlashTlmHandoff(prefill_session, tlm_session) if tlm_prefill_session is not None else None
+    is_hybrid = "cache_commit" in getattr(tlm_session, "input_names", ())
+    target_seq_len = block_size
+    if is_hybrid:
+        if batch_size != 1:
+            raise ValueError("Qwen3.5 DFlash requires batch size 1.")
+        if block_size < 2 or prompt_chunk_size < 2 * block_size or prompt_chunk_size % block_size:
+            raise ValueError(
+                "Qwen3.5 DFlash requires prefill length to be a multiple of block_size and >= 2 * block_size."
+            )
+        target_seq_len = get_qwen35_target_seq_len(tlm_session, block_size)
+    replay_ids = np.full((batch_size, block_size), tokenizer.pad_token_id, dtype=np.int64) if is_hybrid else None
+    replay_positions = np.full((batch_size, block_size), -1, dtype=np.int64) if is_hybrid else None
     prefill_selection = _dflash_logit_selection_inputs(prefill_session, 1)
     decode_selection = _dflash_logit_selection_inputs(tlm_session, block_size)
     prefill_logits = 1 if prefill_selection or tlm_prefill_session is not None else prompt_chunk_size
@@ -341,8 +383,11 @@ def run_spd_inference_single(
         outputs = prefill_session.run(
             {
                 "input_ids": input_ids[:, chunk_start:chunk_end],
-                "position_ids": position_ids[:, chunk_start:chunk_end],
+                "position_ids": _format_position_ids_for_session(
+                    prefill_session, position_ids[:, chunk_start:chunk_end]
+                ),
                 **prefill_selection,
+                **({"cache_commit": np.ones(1, dtype=np.int64)} if is_hybrid else {}),
                 **(handoff.outputs if handoff is not None and last_chunk else {}),
             }
         )
@@ -353,22 +398,33 @@ def run_spd_inference_single(
 
     def prepare_decode():
         tlm_session.set_buffers({"logits": np.zeros((batch_size, block_size), dtype=np.int32)})
-        tlm_session.set_buffers({"hidden_states": np.zeros((batch_size, block_size, hidden_size), dtype=np.float32)})
+        tlm_session.set_buffers(
+            {"hidden_states": np.zeros((batch_size, target_seq_len, hidden_size), dtype=np.float32)}
+        )
 
     def tlm_decode(draft_ids, decode_position_ids):
         nonlocal handoff
+        if is_hybrid:
+            draft_ids = np.concatenate([replay_ids, draft_ids], axis=-1)
+            decode_position_ids = np.concatenate([replay_positions, decode_position_ids], axis=-1)
         outputs = tlm_session.run(
             {
                 "input_ids": draft_ids,
-                "position_ids": decode_position_ids,
+                "position_ids": _format_position_ids_for_session(tlm_session, decode_position_ids),
                 **decode_selection,
+                **({"cache_commit": np.zeros(1, dtype=np.int64)} if is_hybrid else {}),
                 **(handoff.inputs if handoff is not None else {}),
             }
         )
         if handoff is not None:
             tlm_session.skip_buffers(handoff.inputs)
             handoff = None
-        return outputs["logits"], outputs["hidden_states"]
+        return outputs["logits"][:, :block_size], outputs["hidden_states"][:, -block_size:]
+
+    def queue_accepted_prefix(draft_ids, decode_position_ids, count):
+        replay_ids[:] = draft_ids
+        replay_positions[:] = decode_position_ids
+        replay_positions[:, count:] = -1
 
     eos_token_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
     return _run_spd_core(
@@ -388,6 +444,8 @@ def run_spd_inference_single(
         eos_token_ids=eos_token_ids,
         generated_ids=generated_ids,
         metrics=metrics,
+        queue_accepted_prefix=queue_accepted_prefix if is_hybrid else None,
+        draft_selector=draft_selector,
     )
 
 
@@ -756,6 +814,7 @@ def run_spd_inference_qwen3_vl(
     batch_size: int = 1,
     tlm_prefill_session: QAICInferenceSession | None = None,
     enable_thinking: bool | None = None,
+    draft_selector: Callable[[dict[str, np.ndarray], np.ndarray], np.ndarray] | None = None,
 ) -> SpecDecodingMetrics:
     """Run Qwen3-VL, Qwen3.5 or Qwen3.5-MoE DFlash for a text or image prompt."""
     is_qwen35 = tlm_config.model_type in {"qwen3_5", "qwen3_5_moe"}
@@ -918,4 +977,5 @@ def run_spd_inference_qwen3_vl(
         metrics=metrics,
         prefill_start_time=prefill_start,
         queue_accepted_prefix=queue_accepted_prefix if is_qwen35 else None,
+        draft_selector=draft_selector,
     )
